@@ -1,6 +1,12 @@
 {
   "strategies": [
     {
+      "name": "super_alpha_1",
+      "signal_path": "strategies/super_alpha_1/signal.json",
+      "extra_twd": 0,
+      "cash_out_twd": 0
+    },
+    {
       "name": "super_alpha_4",
       "signal_path": "strategies/super_alpha_4/signal.json",
       "extra_twd": 0,
