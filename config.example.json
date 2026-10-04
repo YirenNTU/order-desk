@@ -16,7 +16,13 @@
   "mode": "simulation",
   "lot_mode": "odd",
   "schedule": {
-    "git_pull": {"weekday": "monday", "time": "08:00"},
-    "order": {"weekday": "monday", "time": "09:20"}
+    "git_pull": {
+      "weekday": "monday",
+      "time": "08:00"
+    },
+    "order": {
+      "weekday": "monday",
+      "time": "09:20"
+    }
   }
 }
