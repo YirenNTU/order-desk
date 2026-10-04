@@ -1,0 +1,7 @@
+.env
+config.json
+ledger.json
+strategies/*/ledger.json
+__pycache__/
+.venv/
+logs/

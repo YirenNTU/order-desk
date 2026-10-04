@@ -1,0 +1,16 @@
+{
+  "strategies": [
+    {
+      "name": "super_alpha_4",
+      "signal_path": "strategies/super_alpha_4/signal.json",
+      "extra_twd": 0,
+      "cash_out_twd": 0
+    }
+  ],
+  "mode": "simulation",
+  "lot_mode": "odd",
+  "schedule": {
+    "git_pull": {"weekday": "monday", "time": "08:00"},
+    "order": {"weekday": "monday", "time": "09:20"}
+  }
+}
