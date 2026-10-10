@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
             cash_reserve_twd=policy.cash_reserve_twd,
             wait_seconds=float(config.get("sell_wait_seconds", 30)),
             poll_seconds=float(config.get("sell_poll_seconds", 2)),
+            cash_check=policy.cash_check,
         )
         save_account_ledger(root, ledger, ledger_paths)
         _print_submit_status(status, ledger)
@@ -228,6 +229,7 @@ def _policy(config: dict, several: bool) -> ExecutionPolicy:
         max_position_twd=float(config.get("max_position_twd", 50_000_000)),
         max_turnover=float(config.get("max_turnover", 2)),
         allow_sell_proceeds_for_buys=several,
+        cash_check=bool(config.get("cash_check", False)),
     )
 
 

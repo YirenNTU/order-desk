@@ -11,10 +11,17 @@
       "signal_path": "strategies/super_alpha_4/signal.json",
       "extra_twd": 0,
       "cash_out_twd": 0
+    },
+    {
+      "name": "super_alpha_5",
+      "signal_path": "strategies/super_alpha_5/signal.json",
+      "extra_twd": 0,
+      "cash_out_twd": 0
     }
   ],
   "mode": "simulation",
   "lot_mode": "odd",
+  "cash_check": false,
   "schedule": {
     "git_pull": {
       "weekday": "monday",

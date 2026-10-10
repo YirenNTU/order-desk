@@ -132,7 +132,33 @@ def test_cash_must_cover_the_limit_up_reserve(tmp_path: Path):
             {},
             {},
             100_000,
-            ExecutionPolicy(lot_mode="odd", max_order_twd=200_000),
+            ExecutionPolicy(lot_mode="odd", max_order_twd=200_000, cash_check=True),
             mode="production",
             now=NOW,
         )
+
+
+def test_cash_check_off_does_not_block_on_securities_balance(tmp_path: Path):
+    signal = _signal(
+        tmp_path / "weekly-signal.json",
+        [
+            {
+                "strategy_id": "superalpha-1",
+                "weights": [{"ticker": "2330", "weight": 1}],
+            }
+        ],
+    )
+    quote = Quote("2330", bid=99, ask=100, last=100, limit_up=110, limit_down=90)
+    plan = build_order_plan(
+        signal,
+        {"superalpha-1": 100_000},
+        {"2330": quote},
+        {},
+        {},
+        1_000,
+        ExecutionPolicy(lot_mode="odd", max_order_twd=200_000, cash_check=False),
+        mode="production",
+        now=NOW,
+    )
+    assert plan.orders[0].action == "Buy"
+    assert plan.orders[0].limit_price == 110

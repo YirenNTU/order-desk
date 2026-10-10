@@ -314,12 +314,39 @@ def test_buys_wait_when_sell_proceeds_do_not_cover_them():
             cash_reserve_twd=0,
             wait_seconds=0,
             poll_seconds=0,
+            cash_check=True,
         )
     finally:
         worker.close()
     assert status == "buys_waiting_for_cash"
     assert [order["action"] for order in fake.orders.values()] == ["Sell"]
     assert ledger["strategies"] == {}
+
+
+def test_cash_check_off_sends_buys_without_securities_cash():
+    fake = FakeBroker(positions={"2330": 10}, cash=0, auto_fill=True)
+    worker = BrokerWorker(fake)
+    ledger = {"strategies": {"alpha": {"2330": 10}}, "open_orders": []}
+    allocations = {
+        "2330-Sell-10": [{"strategy": "alpha", "shares": 10, "applied": 0}],
+        "2317-Buy-10": [{"strategy": "alpha", "shares": 10, "applied": 0}],
+    }
+    try:
+        worker.call("connect")
+        status = submit_sells_then_buys(
+            worker,
+            [_intent("2330", "Sell", 10, 100), _intent("2317", "Buy", 10, 150)],
+            ledger,
+            allocations,
+            cash_reserve_twd=0,
+            wait_seconds=0,
+            poll_seconds=0,
+            cash_check=False,
+        )
+    finally:
+        worker.close()
+    assert status == "completed"
+    assert [order["action"] for order in fake.orders.values()] == ["Sell", "Buy"]
 
 
 def test_each_strategy_has_its_own_ledger_file(tmp_path: Path):

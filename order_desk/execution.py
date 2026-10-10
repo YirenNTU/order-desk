@@ -77,6 +77,7 @@ def submit_sells_then_buys(
     cash_reserve_twd: float,
     wait_seconds: float,
     poll_seconds: float,
+    cash_check: bool = False,
 ) -> str:
     """Place sells first. Buys go out only after every sell is filled and cash covers them."""
     if ledger["open_orders"]:
@@ -97,7 +98,7 @@ def submit_sells_then_buys(
         return "sells_working"
     buy_twd = sum(order.estimated_notional for order in buys)
     buying_power = max(0.0, float(worker.call("available_cash")) - cash_reserve_twd)
-    if buy_twd > buying_power + 1e-6:
+    if cash_check and buy_twd > buying_power + 1e-6:
         return "buys_waiting_for_cash"
     for order in buys:
         result = worker.call("place_order", order)

@@ -241,7 +241,7 @@ def build_order_plan(
     buying_power = max(0.0, available_cash - policy.cash_reserve_twd)
     if policy.allow_sell_proceeds_for_buys:
         buying_power += sell_twd
-    if buy_twd > buying_power + 1e-6:
+    if policy.cash_check and buy_twd > buying_power + 1e-6:
         raise PlanningError("planned buys exceed conservative available cash")
 
     ordered = tuple(

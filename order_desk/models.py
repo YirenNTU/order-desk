@@ -38,6 +38,7 @@ class ExecutionPolicy:
     max_position_twd: float = 1_000_000.0
     max_turnover: float = 2.0
     allow_sell_proceeds_for_buys: bool = False
+    cash_check: bool = False
     order_ttl_seconds: int = 120
 
 
