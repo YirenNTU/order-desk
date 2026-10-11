@@ -17,6 +17,12 @@
       "signal_path": "strategies/super_alpha_5/signal.json",
       "extra_twd": 0,
       "cash_out_twd": 0
+    },
+    {
+      "name": "rolling_top_10",
+      "signal_path": "strategies/rolling_top_10/signal.json",
+      "extra_twd": 0,
+      "cash_out_twd": 0
     }
   ],
   "mode": "simulation",
