@@ -1,14 +1,14 @@
 {
-  "bundle_id": "rolling-top-10-2026-10-08",
+  "bundle_id": "rolling-top-10-2026-10-16",
   "revision": 1,
-  "effective_at": "2026-10-12T00:00:00+08:00",
-  "expires_at": "2026-10-19T00:00:00+08:00",
-  "data_as_of": "2026-10-08",
+  "effective_at": "2026-10-19T00:00:00+08:00",
+  "expires_at": "2026-10-27T00:00:00+08:00",
+  "data_as_of": "2026-10-16",
   "strategies": [
     {
       "strategy_id": "rolling_top_10",
       "weights": [
-        {"ticker": "2383", "weight": 0.1},
+        {"ticker": "2408", "weight": 0.1},
         {"ticker": "3037", "weight": 0.1},
         {"ticker": "3081", "weight": 0.1},
         {"ticker": "3105", "weight": 0.1},
