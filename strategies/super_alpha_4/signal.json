@@ -1,23 +1,23 @@
 {
-  "bundle_id": "super-alpha-4-2026-10-16",
+  "bundle_id": "super-alpha-4-2026-10-22",
   "revision": 1,
-  "effective_at": "2026-10-19T00:00:00+08:00",
-  "expires_at": "2026-10-27T00:00:00+08:00",
-  "data_as_of": "2026-10-16",
+  "effective_at": "2026-10-27T00:00:00+08:00",
+  "expires_at": "2026-11-02T00:00:00+08:00",
+  "data_as_of": "2026-10-22",
   "strategies": [
     {
       "strategy_id": "super_alpha_4",
       "weights": [
         {"ticker": "2492", "weight": 0.15},
         {"ticker": "6139", "weight": 0.15},
-        {"ticker": "6691", "weight": 0.140971369535},
-        {"ticker": "6196", "weight": 0.098005630603},
-        {"ticker": "2327", "weight": 0.097569582535},
-        {"ticker": "3665", "weight": 0.084426210097},
-        {"ticker": "3037", "weight": 0.07609701975},
-        {"ticker": "6442", "weight": 0.071076253312},
-        {"ticker": "2317", "weight": 0.065926967084},
-        {"ticker": "2382", "weight": 0.065926967084}
+        {"ticker": "6691", "weight": 0.136479851769},
+        {"ticker": "2327", "weight": 0.099706949639},
+        {"ticker": "6196", "weight": 0.099668115148},
+        {"ticker": "6442", "weight": 0.091140979044},
+        {"ticker": "3037", "weight": 0.079851865502},
+        {"ticker": "3665", "weight": 0.076668598618},
+        {"ticker": "2317", "weight": 0.058311826138},
+        {"ticker": "2382", "weight": 0.058171814143}
       ]
     }
   ]
