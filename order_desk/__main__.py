@@ -26,13 +26,18 @@ from order_desk.schedule import (
     due_actions,
     git_root,
     install_schedule,
+    order_stamp_blocks_retry,
     order_stamp_path,
     pull_is_current,
     pull_stamp_path,
     run_git_pull,
+    schedule_enabled,
     schedule_slots,
     taipei_now,
+    uninstall_schedule,
+    week_id_for,
     within_order_session,
+    write_order_stamp,
 )
 from order_desk.signal import SignalError, budgets_for, load_signal
 
@@ -49,7 +54,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--install-schedule",
         action="store_true",
-        help="install this computer's Monday git pull and order jobs",
+        help="install this computer's weekly git pull and order checker",
+    )
+    parser.add_argument(
+        "--uninstall-schedule",
+        action="store_true",
+        help="remove this computer's weekly LaunchAgent",
     )
     parser.add_argument("--weekly-pull", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--weekly-order", action="store_true", help=argparse.SUPPRESS)
@@ -64,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     root = config_path.parent
     if args.install_schedule:
         return _install_schedule(config_path, config)
+    if args.uninstall_schedule:
+        return _uninstall_schedule(config_path)
     if args.weekly_tick:
         return _weekly_tick(config_path, config)
     if args.weekly_pull:
@@ -163,6 +175,7 @@ def _plan_several(worker, config, root, policy, mode, ledger):
         {
             str(item["ticker"])
             for entry in entries
+            if entry.get("adjust_positions", True) and entry.get("strategy")
             for item in entry["strategy"]["weights"]
         }
         | {
@@ -319,27 +332,45 @@ def _install_schedule(config_path: Path, config: dict) -> int:
         return 1
     for path in written:
         print(f"installed {path}")
-    print("installed; Taipei time, on the week's first day the market is open")
+    print("installed; Taipei time, first open day through Friday catch-up")
+    print("change schedule times in config.json without reinstalling; set schedule.enabled false to pause")
+    return 0
+
+
+def _uninstall_schedule(config_path: Path) -> int:
+    try:
+        removed = uninstall_schedule(
+            config_path,
+            agents_dir=Path.home() / "Library" / "LaunchAgents",
+            domain=f"gui/{os.getuid()}",
+        )
+    except (OSError, SignalError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for label in removed:
+        print(f"removed {label}")
     return 0
 
 
 def _weekly_tick(config_path: Path, config: dict) -> int:
     root = config_path.parent
     now = taipei_now()
-    today = now.date().isoformat()
+    today = now.date()
+    today_text = today.isoformat()
     calendar = TwseCalendar(root / "logs" / "twse-holidays.json")
     try:
         actions = due_actions(
             now,
             schedule_slots(config),
-            pull_done=pull_is_current(pull_stamp_path(root), today),
-            order_done=pull_is_current(order_stamp_path(root), today),
+            pull_done=pull_is_current(pull_stamp_path(root), today_text),
+            order_done=order_stamp_blocks_retry(order_stamp_path(root), today),
             is_trading_day=calendar.is_trading_day,
+            enabled=schedule_enabled(config),
         )
     except CalendarUnavailable as exc:
         _note_once(
             root / "logs" / "calendar_block.json",
-            today,
+            today_text,
             f"TWSE holiday calendar unavailable; nothing was run ({exc})",
         )
         return 1
@@ -349,15 +380,31 @@ def _weekly_tick(config_path: Path, config: dict) -> int:
         _weekly_pull(root)
     if "order" not in actions:
         return 0
-    if not pull_is_current(pull_stamp_path(root), today):
+    if not pull_is_current(pull_stamp_path(root), today_text):
         print("today's git pull did not succeed; no orders were sent")
         return 1
-    order_stamp_path(root).parent.mkdir(parents=True, exist_ok=True)
-    order_stamp_path(root).write_text(
-        json.dumps({"ok": True, "trading_day": today}) + "\n",
-        encoding="utf-8",
+    code = main(["--config", str(config_path), "--weekly-order"])
+    status = _weekly_order_status(root, code)
+    write_order_stamp(
+        order_stamp_path(root),
+        week=week_id_for(today),
+        trading_day=today_text,
+        status=status,
     )
-    return main(["--config", str(config_path), "--weekly-order"])
+    print(f"weekly order status: {status}")
+    return 0 if status != "failed" else max(code, 1)
+
+
+def _weekly_order_status(root: Path, code: int) -> str:
+    try:
+        ledger, _ = load_account_ledger(root)
+    except SignalError:
+        return "failed"
+    if ledger.get("open_orders"):
+        return "working"
+    if code != 0:
+        return "failed"
+    return "completed"
 
 
 def _note_once(path: Path, today: str, message: str) -> None:

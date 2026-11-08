@@ -219,6 +219,62 @@ def test_removed_strategy_is_not_silently_sold(tmp_path: Path):
         )
 
 
+def test_adjust_positions_off_keeps_holdings_out_of_orders(tmp_path: Path):
+    root = tmp_path
+    _write_signal(
+        root / "strategies" / "alpha" / "signal.json",
+        "alpha",
+        [
+            {"ticker": "2330", "weight": 0.5, "close": 100},
+            {"ticker": "2317", "weight": 0.5, "close": 100},
+        ],
+    )
+    expired = {
+        "bundle_id": "11111111-1111-1111-1111-111111111111",
+        "revision": 1,
+        "effective_at": (NOW - timedelta(days=10)).isoformat(),
+        "expires_at": (NOW - timedelta(days=3)).isoformat(),
+        "data_as_of": "2026-09-01",
+        "strategies": [{"strategy_id": "beta", "weights": [{"ticker": "2330", "weight": 1}]}],
+    }
+    beta_path = root / "strategies" / "beta" / "signal.json"
+    beta_path.parent.mkdir(parents=True)
+    beta_path.write_text(json.dumps(expired), encoding="utf-8")
+    config = {
+        "strategies": [
+            {"name": "alpha", "signal_path": "strategies/alpha/signal.json"},
+            {
+                "name": "beta",
+                "signal_path": "strategies/beta/signal.json",
+                "adjust_positions": False,
+                "extra_twd": 100_000,
+            },
+        ]
+    }
+    ledger = {
+        "strategies": {"alpha": {"2330": 2000}, "beta": {"2317": 500}},
+        "open_orders": [],
+    }
+    preview = plan_strategies(
+        load_strategy_entries(config, root, now=NOW),
+        ledger,
+        {"2330": _quote("2330"), "2317": _quote("2317")},
+        {"2330": 2000, "2317": 500},
+        0,
+        _policy(),
+        mode="simulation",
+        now=NOW,
+    )
+    assert preview["booked"]["beta"] == {"2317": 500}
+    assert preview["targets"]["beta"] == {"2317": 500}
+    assert preview["targets"]["alpha"] == {"2330": 1000, "2317": 1000}
+    assert [(order.action, order.ticker, order.shares) for order in preview["plan"].orders] == [
+        ("Sell", "2330", 1000),
+        ("Buy", "2317", 1000),
+    ]
+    assert any("adjust_positions off" in note for note in preview["notes"])
+
+
 def test_live_price_sizes_the_shares_even_when_the_file_has_an_old_close():
     signal = {
         "bundle_id": "11111111-1111-1111-1111-111111111111",

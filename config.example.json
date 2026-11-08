@@ -1,12 +1,6 @@
 {
   "strategies": [
     {
-      "name": "super_alpha_1",
-      "signal_path": "strategies/super_alpha_1/signal.json",
-      "extra_twd": 0,
-      "cash_out_twd": 0
-    },
-    {
       "name": "super_alpha_4",
       "signal_path": "strategies/super_alpha_4/signal.json",
       "extra_twd": 0,
@@ -22,13 +16,15 @@
       "name": "rolling_top_10",
       "signal_path": "strategies/rolling_top_10/signal.json",
       "extra_twd": 0,
-      "cash_out_twd": 0
+      "cash_out_twd": 0,
+      "adjust_positions": true
     }
   ],
   "mode": "simulation",
   "lot_mode": "odd",
   "cash_check": false,
   "schedule": {
+    "enabled": true,
     "git_pull": {
       "weekday": "monday",
       "time": "08:00"

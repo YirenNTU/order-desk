@@ -14,10 +14,15 @@ from order_desk.models import ExecutionPolicy, Quote
 from order_desk.schedule import (
     due_actions,
     install_schedule,
+    order_stamp_blocks_retry,
     pull_is_current,
     run_git_pull,
+    schedule_enabled,
     schedule_slots,
+    uninstall_schedule,
+    week_id_for,
     within_order_session,
+    write_order_stamp,
 )
 from order_desk.signal import load_signal
 
@@ -108,6 +113,77 @@ def test_holiday_monday_moves_the_jobs_to_the_next_open_day():
     ) == ["order"]
 
 
+def test_missed_monday_is_caught_up_later_in_the_week():
+    slots = schedule_slots({})
+    tuesday = datetime(2026, 10, 6, 9, 20, tzinfo=TAIPEI)
+    assert due_actions(
+        tuesday, slots, pull_done=False, order_done=False, is_trading_day=_weekdays_open
+    ) == ["git_pull", "order"]
+    wednesday = datetime(2026, 10, 7, 9, 20, tzinfo=TAIPEI)
+    assert due_actions(
+        wednesday, slots, pull_done=True, order_done=False, is_trading_day=_weekdays_open
+    ) == ["order"]
+    saturday = datetime(2026, 10, 10, 9, 20, tzinfo=TAIPEI)
+    assert due_actions(
+        saturday, slots, pull_done=False, order_done=False, is_trading_day=_weekdays_open
+    ) == []
+
+
+def test_completed_week_blocks_later_catchup(tmp_path: Path):
+    slots = schedule_slots({})
+    stamp = tmp_path / "last_order.json"
+    write_order_stamp(
+        stamp,
+        week=week_id_for(date(2026, 10, 5)),
+        trading_day="2026-10-05",
+        status="completed",
+    )
+    assert order_stamp_blocks_retry(stamp, date(2026, 10, 5))
+    assert order_stamp_blocks_retry(stamp, date(2026, 10, 7))
+    wednesday = datetime(2026, 10, 7, 9, 20, tzinfo=TAIPEI)
+    assert due_actions(
+        wednesday,
+        slots,
+        pull_done=True,
+        order_done=order_stamp_blocks_retry(stamp, date(2026, 10, 7)),
+        is_trading_day=_weekdays_open,
+    ) == []
+
+
+def test_failed_order_retries_same_day_and_working_waits(tmp_path: Path):
+    stamp = tmp_path / "last_order.json"
+    write_order_stamp(
+        stamp,
+        week=week_id_for(date(2026, 10, 5)),
+        trading_day="2026-10-05",
+        status="failed",
+    )
+    assert not order_stamp_blocks_retry(stamp, date(2026, 10, 5))
+    write_order_stamp(
+        stamp,
+        week=week_id_for(date(2026, 10, 5)),
+        trading_day="2026-10-05",
+        status="working",
+    )
+    assert order_stamp_blocks_retry(stamp, date(2026, 10, 5))
+    assert not order_stamp_blocks_retry(stamp, date(2026, 10, 6))
+
+
+def test_disabled_schedule_runs_nothing():
+    slots = schedule_slots({"schedule": {"enabled": False}})
+    assert schedule_enabled({"schedule": {"enabled": False}}) is False
+    assert schedule_enabled({}) is True
+    monday = datetime(2026, 10, 5, 9, 20, tzinfo=TAIPEI)
+    assert due_actions(
+        monday,
+        slots,
+        pull_done=False,
+        order_done=False,
+        is_trading_day=_weekdays_open,
+        enabled=False,
+    ) == []
+
+
 def test_order_job_only_runs_inside_the_session_after_a_successful_pull(tmp_path: Path):
     stamp = tmp_path / "last_pull.json"
     assert pull_is_current(stamp, "2026-10-05") is False
@@ -136,11 +212,12 @@ def test_install_writes_one_job_per_computer(tmp_path: Path):
             "order": {"weekday": "monday", "time": "09:20"},
         }
     }
+    agents = tmp_path / "agents"
     written = install_schedule(
         config_path,
         config,
         python="/usr/bin/python3",
-        agents_dir=tmp_path / "agents",
+        agents_dir=agents,
         domain="gui/1",
         load=False,
     )
@@ -149,6 +226,9 @@ def test_install_writes_one_job_per_computer(tmp_path: Path):
     assert job["StartInterval"] == 60
     assert "--weekly-tick" in job["ProgramArguments"]
     assert str(config_path) in job["ProgramArguments"]
+    assert written[0].is_file()
+    uninstall_schedule(config_path, agents_dir=agents, domain="gui/1", load=False)
+    assert not written[0].is_file()
 
 
 def test_same_weights_resize_the_next_day_from_the_live_price(tmp_path: Path):

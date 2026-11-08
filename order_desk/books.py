@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from order_desk.capital import combined_shares, target_value
-from order_desk.models import ExecutionPolicy, Quote
+from order_desk.models import ExecutionPolicy, OrderPlan, Quote
 from order_desk.planner import PlanningError, build_order_plan
 from order_desk.signal import SignalError, load_signal
 
@@ -38,6 +38,20 @@ def load_strategy_entries(
         signal_path = Path(str(row.get("signal_path", ""))).expanduser()
         if not signal_path.is_absolute():
             signal_path = (root / signal_path).resolve()
+        adjust_positions = _adjust_positions(row)
+        if not adjust_positions:
+            entries.append(
+                {
+                    "name": name,
+                    "path": signal_path,
+                    "signal": None,
+                    "strategy": None,
+                    "extra_twd": 0,
+                    "cash_out_twd": 0,
+                    "adjust_positions": False,
+                }
+            )
+            continue
         signal = load_signal(signal_path, now=now)
         strategies = signal["strategies"]
         if len(strategies) != 1:
@@ -53,9 +67,16 @@ def load_strategy_entries(
                 "strategy": strategy,
                 "extra_twd": row.get("extra_twd", 0),
                 "cash_out_twd": row.get("cash_out_twd", 0),
+                "adjust_positions": True,
             }
         )
     return entries
+
+
+def _adjust_positions(row: Mapping[str, Any]) -> bool:
+    if "adjust_positions" not in row:
+        return True
+    return bool(row.get("adjust_positions"))
 
 
 def plan_strategies(
@@ -79,12 +100,18 @@ def plan_strategies(
     notes: list[str] = []
     budgets: dict[str, float] = {}
     active: list[dict[str, Any]] = []
+    paused_held: dict[str, dict[str, int]] = {}
     for entry in entries:
         name = entry["name"]
         held = {
             str(ticker): int(shares)
             for ticker, shares in ledger["strategies"].get(name, {}).items()
         }
+        if not entry.get("adjust_positions", True):
+            notes.append(f"{name}: adjust_positions off, holdings left unchanged")
+            if held:
+                paused_held[name] = held
+            continue
         value, note = target_value(
             name, held, quotes, entry["extra_twd"], entry["cash_out_twd"]
         )
@@ -95,7 +122,11 @@ def plan_strategies(
         budgets[name] = value
         active.append(entry)
     if not active:
-        raise SignalError("no strategy has holdings or extra money")
+        if not paused_held and not any(
+            ledger["strategies"].get(entry["name"]) for entry in entries
+        ):
+            raise SignalError("no strategy has holdings or extra money")
+        return _paused_only_preview(entries, ledger, notes, paused_held, mode=mode)
 
     current = now or datetime.now(timezone.utc)
     bundle = _merge_bundle(active, current)
@@ -121,6 +152,10 @@ def plan_strategies(
     booked = book_internal(before, targets)
     residuals = signed_diff(booked, targets)
     allocations = tag_orders(plan.orders, residuals)
+    for name, positions in paused_held.items():
+        booked[name] = dict(positions)
+        before[name] = dict(positions)
+        targets[name] = dict(positions)
     return {
         "plan": plan,
         "notes": notes,
@@ -128,6 +163,42 @@ def plan_strategies(
         "targets": targets,
         "booked": booked,
         "allocations": allocations,
+        "paths": {entry["name"]: entry["path"] for entry in entries},
+    }
+
+
+def _paused_only_preview(
+    entries: list[dict[str, Any]],
+    ledger: Mapping[str, Any],
+    notes: list[str],
+    paused_held: Mapping[str, Mapping[str, int]],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    held = {name: dict(positions) for name, positions in paused_held.items()}
+    plan = OrderPlan(
+        bundle_id="paused",
+        revision=0,
+        mode=mode,  # type: ignore[arg-type]
+        data_as_of="",
+        targets={},
+        sleeve_targets={name: dict(positions) for name, positions in held.items()},
+        managed_before=combined_shares(held) if held else {},
+        external_positions={},
+        orders=(),
+        estimated_buy_twd=0.0,
+        estimated_sell_twd=0.0,
+        total_budget_twd=0.0,
+        cash_reserve_twd=0.0,
+        warnings=("all configured strategies have adjust_positions off",),
+    )
+    return {
+        "plan": plan,
+        "notes": notes,
+        "before": held,
+        "targets": held,
+        "booked": held,
+        "allocations": {},
         "paths": {entry["name"]: entry["path"] for entry in entries},
     }
 
