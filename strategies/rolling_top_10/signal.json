@@ -1,15 +1,15 @@
 {
-  "bundle_id": "rolling-top-10-2026-10-30",
+  "bundle_id": "rolling-top-10-2026-11-06",
   "revision": 1,
-  "effective_at": "2026-11-02T00:00:00+08:00",
-  "expires_at": "2026-11-09T00:00:00+08:00",
-  "data_as_of": "2026-10-30",
+  "effective_at": "2026-11-09T00:00:00+08:00",
+  "expires_at": "2026-11-16T00:00:00+08:00",
+  "data_as_of": "2026-11-06",
   "strategies": [
     {
       "strategy_id": "rolling_top_10",
       "weights": [
         {"ticker": "2383", "weight": 0.1},
-        {"ticker": "2408", "weight": 0.1},
+        {"ticker": "2412", "weight": 0.1},
         {"ticker": "3037", "weight": 0.1},
         {"ticker": "3081", "weight": 0.1},
         {"ticker": "3105", "weight": 0.1},
@@ -17,7 +17,7 @@
         {"ticker": "3443", "weight": 0.1},
         {"ticker": "3711", "weight": 0.1},
         {"ticker": "6213", "weight": 0.1},
-        {"ticker": "8046", "weight": 0.1}
+        {"ticker": "6446", "weight": 0.1}
       ]
     }
   ]
