@@ -136,6 +136,10 @@ def build_order_plan(
     *,
     mode: str = "dry_run",
     now: datetime | None = None,
+    frozen_tickers: set[str] | None = None,
+    inventory_quarantine: set[str] | None = None,
+    sleeve_current: Mapping[str, Mapping[str, int]] | None = None,
+    fixed_targets: Mapping[str, Mapping[str, int]] | None = None,
 ) -> OrderPlan:
     if mode not in {"dry_run", "simulation", "production"}:
         raise PlanningError("invalid execution mode")
@@ -164,6 +168,10 @@ def build_order_plan(
     if policy.lot_mode == "odd" and mode != "production":
         warnings.append("Simulation/dry-run uses common lots because SinoPac simulation rejects odd lots.")
 
+    quarantined = inventory_quarantine or set()
+    frozen = (frozen_tickers or set()) | quarantined
+    sleeve_current = sleeve_current or {}
+    fixed_targets = fixed_targets or {}
     sleeve_targets: dict[str, dict[str, int]] = {}
     total_budget = 0.0
     for strategy in bundle["strategies"]:
@@ -171,15 +179,40 @@ def build_order_plan(
         budget = float(budgets.get(strategy_id, 0.0))
         if not math.isfinite(budget) or budget < 0:
             raise PlanningError(f"{strategy_id}: budget is invalid")
+        total_budget += budget
+        if strategy_id in fixed_targets:
+            sleeve_targets[strategy_id] = dict(fixed_targets[strategy_id])
+            continue
+        held = sleeve_current.get(strategy_id, {})
+        locked = {t: int(q) for t, q in held.items() if t in frozen and int(q)}
+        for ticker in locked:
+            if ticker not in quotes:
+                raise PlanningError(f"{ticker}: quote required to value frozen holdings")
+            _validate_quote(quotes[ticker])
+        locked_value = sum(q * _price_for_size(quotes[t]) for t, q in locked.items())
+        if locked_value > budget + 1e-6:
+            raise PlanningError(f"{strategy_id}: frozen holdings exceed cycle budget; withdrawal/reweight needs review")
+        tradable_budget = max(0.0, budget - locked_value)
+        weights = [item for item in strategy['weights'] if str(item['ticker']) not in frozen]
+        affected = bool(locked) or len(weights) != len(strategy['weights'])
+        denominator = sum(float(item['weight']) for item in weights) if affected else 1.0
+        if not math.isfinite(denominator) or denominator < 0:
+            raise PlanningError(f"{strategy_id}: invalid remaining weights")
+        sleeve = dict(locked)
+        if affected:
+            warnings.append(f"{strategy_id}: budget {budget:,.2f} - frozen holdings {locked_value:,.2f} = tradable {tradable_budget:,.2f}; remaining weights normalized")
         if budget == 0:
             warnings.append(f"{strategy_id}: target value is zero, so managed shares are sold.")
-            sleeve_targets[strategy_id] = {}
-            continue
-        total_budget += budget
-        sleeve: dict[str, int] = {}
-        for item in strategy["weights"]:
-            ticker = str(item["ticker"])
-            shares = int((budget * float(item["weight"])) // _price_for_size(quotes[ticker]))
+        if denominator == 0:
+            warnings.append(f"{strategy_id}: no tradable positive weights; {tradable_budget:,.2f} remains unallocated")
+        for item in weights if denominator else []:
+            ticker = str(item['ticker'])
+            weight = float(item['weight'])
+            if not math.isfinite(weight) or weight < 0:
+                raise PlanningError(f"{strategy_id}: invalid weight")
+            if tradable_budget == 0 or weight == 0:
+                continue
+            shares = int((tradable_budget * weight / denominator) // _price_for_size(quotes[ticker]))
             if not odd_lots_enabled:
                 shares = shares // 1000 * 1000
             if shares > 0:
@@ -197,18 +230,23 @@ def build_order_plan(
     broker = {str(key): int(value) for key, value in broker_positions.items() if int(value)}
     external: dict[str, int] = {}
     for ticker in set(managed) | set(broker):
-        if managed.get(ticker, 0) > broker.get(ticker, 0):
+        if managed.get(ticker, 0) > broker.get(ticker, 0) and ticker not in quarantined:
             raise PlanningError(
                 f"{ticker}: managed ledger exceeds broker position; reconcile manual trading first"
             )
         difference = broker.get(ticker, 0) - managed.get(ticker, 0)
-        if difference:
+        if difference > 0:
             external[ticker] = difference
     if external:
         warnings.append("External account holdings are excluded from sellable managed inventory.")
 
     orders: list[OrderIntent] = []
     for ticker in sorted(set(targets) | set(managed)):
+        if ticker in quarantined:
+            if targets.get(ticker, 0) != managed.get(ticker, 0):
+                raise PlanningError(f"{ticker}: quarantined inventory must remain unchanged")
+            warnings.append(f"{ticker}: inventory discrepancy quarantined; no orders for this symbol")
+            continue
         if ticker not in quotes:
             raise PlanningError(f"{ticker}: quote required for an existing managed position")
         _validate_quote(quotes[ticker])

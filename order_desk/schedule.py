@@ -28,7 +28,7 @@ WEEKDAYS = {
     "saturday": 5,
     "sunday": 6,
 }
-ORDER_STATUSES = {"completed", "working", "failed"}
+ORDER_STATUSES = {"completed", "completed_with_deferrals", "working", "failed"}
 
 
 def taipei_now() -> datetime:
@@ -125,9 +125,7 @@ def order_stamp_blocks_retry(path: Path, today: date) -> bool:
             return True
         return False
     status = str(payload.get("status", ""))
-    if status == "completed":
-        return True
-    if status == "working" and payload.get("trading_day") == today.isoformat():
+    if status in {"completed", "completed_with_deferrals"}:
         return True
     return False
 
@@ -143,7 +141,7 @@ def write_order_stamp(
     if status not in ORDER_STATUSES:
         raise SignalError(f"order stamp status must be one of {sorted(ORDER_STATUSES)}")
     payload: dict[str, Any] = {
-        "ok": status == "completed",
+        "ok": status in {"completed", "completed_with_deferrals"},
         "week": week,
         "trading_day": trading_day,
         "status": status,

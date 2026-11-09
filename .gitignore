@@ -5,3 +5,6 @@ strategies/*/ledger.json
 __pycache__/
 .venv/
 logs/
+
+.DS_Store
+shioaji.log

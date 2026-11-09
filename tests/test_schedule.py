@@ -150,7 +150,7 @@ def test_completed_week_blocks_later_catchup(tmp_path: Path):
     ) == []
 
 
-def test_failed_order_retries_same_day_and_working_waits(tmp_path: Path):
+def test_failed_or_working_orders_are_checked_again_the_same_day(tmp_path: Path):
     stamp = tmp_path / "last_order.json"
     write_order_stamp(
         stamp,
@@ -165,7 +165,7 @@ def test_failed_order_retries_same_day_and_working_waits(tmp_path: Path):
         trading_day="2026-10-05",
         status="working",
     )
-    assert order_stamp_blocks_retry(stamp, date(2026, 10, 5))
+    assert not order_stamp_blocks_retry(stamp, date(2026, 10, 5))
     assert not order_stamp_blocks_retry(stamp, date(2026, 10, 6))
 
 

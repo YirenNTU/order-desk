@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from order_desk.capital import combined_shares, target_value
+from order_desk.deferrals import cycle_id, frozen_tickers, signal_signature
 from order_desk.models import ExecutionPolicy, OrderPlan, Quote
 from order_desk.planner import PlanningError, build_order_plan
 from order_desk.signal import SignalError, load_signal
@@ -97,7 +98,19 @@ def plan_strategies(
         raise SignalError(
             "ledger has strategies missing from config: " + ", ".join(unknown)
         )
+    for ticker, shares in combined_shares(ledger["strategies"]).items():
+        if shares > broker_positions.get(ticker, 0) and ticker not in ledger.get('inventory_quarantine', {}):
+            raise SignalError(f"{ticker}: managed ledger {shares} exceeds broker position {broker_positions.get(ticker, 0)}; reconcile fills/manual trading first")
+    current_cycle = cycle_id(now)
+    frozen = frozen_tickers(ledger, current_cycle)
+    pending = ledger.get('execution', {})
+    reweight = bool(pending.get('reweight_required'))
+    same_cycle = pending.get('cycle_id') == current_cycle
+    if reweight and same_cycle and pending.get('signal_signature') != signal_signature(entries):
+        raise SignalError('signal changed since saved execution; review remaining plan before reweighting')
     notes: list[str] = []
+    if reweight and not same_cycle:
+        notes.append('new rebalance cycle: old freeze released; latest weights use the unfinished execution capital cap, without reapplying cash inputs')
     budgets: dict[str, float] = {}
     active: list[dict[str, Any]] = []
     paused_held: dict[str, dict[str, int]] = {}
@@ -112,9 +125,15 @@ def plan_strategies(
             if held:
                 paused_held[name] = held
             continue
-        value, note = target_value(
-            name, held, quotes, entry["extra_twd"], entry["cash_out_twd"]
-        )
+        if reweight:
+            if name not in pending.get('budgets', {}):
+                raise SignalError(f"{name}: original cycle budget missing")
+            value = float(pending['budgets'][name])
+            note = f"{name}: retained original cycle budget {value:,.2f}; sold proceeds are not lost and cash inputs are not applied twice"
+        else:
+            value, note = target_value(
+                name, held, quotes, entry["extra_twd"], entry["cash_out_twd"]
+            )
         notes.append(note)
         if value <= 0 and not held:
             notes.append(f"{name}: skipped, no holdings and no extra money")
@@ -126,10 +145,16 @@ def plan_strategies(
             ledger["strategies"].get(entry["name"]) for entry in entries
         ):
             raise SignalError("no strategy has holdings or extra money")
-        return _paused_only_preview(entries, ledger, notes, paused_held, mode=mode)
+        result = _paused_only_preview(entries, ledger, notes, paused_held, mode=mode)
+        result.update(budgets={}, cycle_id=current_cycle, signal_signature=signal_signature(entries), inventory_quarantine=sorted(ledger.get('inventory_quarantine', {})))
+        return result
 
     current = now or datetime.now(timezone.utc)
     bundle = _merge_bundle(active, current)
+    if reweight or frozen:
+        context = {'source': bundle['bundle_id'], 'cycle': current_cycle,
+                   'frozen': sorted(frozen), 'budgets': budgets, 'current': ledger['strategies']}
+        bundle['bundle_id'] = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:32]
     managed = combined_shares(
         {entry["name"]: ledger["strategies"].get(entry["name"], {}) for entry in active}
     )
@@ -144,6 +169,17 @@ def plan_strategies(
             policy,
             mode=mode,
             now=current,
+            frozen_tickers=frozen,
+            inventory_quarantine=set(ledger.get('inventory_quarantine', {})),
+            sleeve_current=ledger['strategies'],
+            fixed_targets={
+                entry['name']: pending['targets'][entry['name']]
+                for entry in active
+                if reweight and same_cycle
+                and entry['name'] not in pending.get('reallocate_strategies', [])
+                and not (set(ledger['strategies'].get(entry['name'], {})) & frozen)
+                and not any(str(w['ticker']) in frozen for w in entry['strategy']['weights'])
+            },
         )
     except PlanningError as exc:
         raise SignalError(str(exc)) from exc
@@ -158,6 +194,10 @@ def plan_strategies(
         targets[name] = dict(positions)
     return {
         "plan": plan,
+        "budgets": budgets,
+        "inventory_quarantine": sorted(ledger.get('inventory_quarantine', {})),
+        "cycle_id": current_cycle,
+        "signal_signature": signal_signature(entries),
         "notes": notes,
         "before": before,
         "targets": targets,

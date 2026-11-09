@@ -33,5 +33,7 @@
       "weekday": "monday",
       "time": "09:20"
     }
-  }
+  },
+  "inventory_mismatch_policy": "reconcile_actual",
+  "restricted_order_policy": "freeze_reweight"
 }

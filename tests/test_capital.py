@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from order_desk.books import book_internal, load_strategy_entries, plan_strategies
-from order_desk.broker import BrokerWorker, FakeBroker
+from order_desk.broker import BrokerError, BrokerWorker, FakeBroker
 from order_desk.capital import load_account_ledger, save_account_ledger
 from order_desk.execution import refresh_open_orders, submit_sells_then_buys
 from order_desk.models import ExecutionPolicy, OrderIntent, Quote
@@ -326,6 +326,52 @@ def test_send_attributes_fills_to_the_strategy():
     assert ledger["strategies"] == {"alpha": {"2330": 600, "2317": 400}}
 
 
+class _DropAfterSell:
+    def call(self, method: str, order=None):
+        if method == "place_order":
+            if order.action == "Buy":
+                raise AssertionError("buy was sent after the connection dropped")
+            return type("Result", (), {"broker_order_id": "abc", "status": "Submitted"})()
+        if method == "reconcile_orders":
+            raise BrokerError("update_status timed out")
+        raise AssertionError(method)
+
+
+def test_status_timeout_keeps_the_sell_and_does_not_send_the_buy(tmp_path: Path):
+    worker = _DropAfterSell()
+    ledger = {"strategies": {"alpha": {"2330": 1000}}, "open_orders": []}
+    allocations = {
+        "2330-Sell-400": [{"strategy": "alpha", "shares": 400, "applied": 0}],
+        "2317-Buy-400": [{"strategy": "alpha", "shares": 400, "applied": 0}],
+    }
+    saved: list[dict] = []
+    status = submit_sells_then_buys(
+        worker,
+        [_intent("2330", "Sell", 400, 100), _intent("2317", "Buy", 400, 100)],
+        ledger,
+        allocations,
+        cash_reserve_twd=0,
+        wait_seconds=0,
+        poll_seconds=0,
+        persist=lambda: saved.append(json.loads(json.dumps(ledger))),
+    )
+    assert status == "sells_working"
+    assert ledger["open_orders"][0]["action"] == "Sell"
+    assert ledger["open_orders"][0]["broker_order_id"] == "abc"
+    assert saved and saved[-1]["open_orders"][0]["broker_order_id"] == "abc"
+
+
+def test_broker_timeout_becomes_a_broker_error():
+    fake = FakeBroker(positions={"2330": 1000}, cash=0, auto_fill=False, fail_after_accept=True)
+    worker = BrokerWorker(fake)
+    try:
+        with pytest.raises(BrokerError, match="place_order failed"):
+            worker.call("place_order", _intent("2330", "Sell", 400, 100))
+    finally:
+        worker.close()
+    assert fake.orders
+
+
 def test_working_sell_blocks_the_buy():
     fake = FakeBroker(positions={"2330": 1000}, cash=1_000_000, auto_fill=False)
     worker = BrokerWorker(fake)
@@ -473,11 +519,11 @@ def test_same_day_miss_is_not_sent_again():
     assert ledger["strategies"] == {"alpha": {"2330": 24}}
 
 
-def test_next_day_missed_buy_is_released_for_a_new_plan():
+def test_next_day_missing_order_requires_reconciliation():
     ledger = {"strategies": {"alpha": {"2330": 24}}, "open_orders": [_open_buy("2026-10-02")]}
     confirmed = refresh_open_orders(_Rows([]), ledger, today="2026-10-05")
-    assert confirmed
-    assert ledger["open_orders"] == []
+    assert not confirmed
+    assert ledger["open_orders"][0]["status"] == "Unconfirmed"
     assert ledger["strategies"] == {"alpha": {"2330": 24}}
 
 

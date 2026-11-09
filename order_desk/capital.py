@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
+import sqlite3
+from contextlib import contextmanager
+import fcntl
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -66,6 +71,15 @@ def save_ledger(path: Path, ledger: Mapping[str, Any]) -> None:
 
 def load_account_ledger(root: Path) -> tuple[dict[str, Any], dict[str, Path]]:
     """Load one ledger file per strategy folder into the combined in-memory book."""
+    db = root / "logs" / "ledger.sqlite3"
+    if db.exists():
+        with sqlite3.connect(db) as conn:
+            row = conn.execute("SELECT payload FROM snapshots ORDER BY revision DESC LIMIT 1").fetchone()
+        if row:
+            ledger = json.loads(row[0])
+            paths = {name: root / "strategies" / name / "ledger.json"
+                     for name in ledger.pop("_paths", [])}
+            return ledger, paths
     strategy_root = root / "strategies"
     files = sorted(strategy_root.glob("*/ledger.json")) if strategy_root.is_dir() else []
     legacy = root / "ledger.json"
@@ -105,6 +119,16 @@ def save_account_ledger(root: Path, ledger: Mapping[str, Any], paths: dict[str, 
     names = _ledger_names(ledger)
     for name in names:
         paths.setdefault(name, root / "strategies" / name / "ledger.json")
+    # The single committed snapshot is authoritative; JSON files are recoverable views.
+    db = root / "logs" / "ledger.sqlite3"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({**ledger, "_paths": sorted(paths)}, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("CREATE TABLE IF NOT EXISTS snapshots (revision INTEGER PRIMARY KEY, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP, payload TEXT NOT NULL)")
+        last = conn.execute("SELECT payload FROM snapshots ORDER BY revision DESC LIMIT 1").fetchone()
+        if not last or last[0] != payload:
+            conn.execute("INSERT INTO snapshots(payload) VALUES (?)", (payload,))
     for name, path in paths.items():
         positions = dict(ledger["strategies"].get(name, {}))
         orders = [
@@ -159,10 +183,42 @@ def _read_strategy_ledger(path: Path, name: str) -> tuple[dict[str, int], list[d
 
 def _write_strategy_ledger(path: Path, positions: Mapping[str, int], orders: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"positions": positions, "open_orders": orders}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    atomic_json(path, {"positions": positions, "open_orders": orders})
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".ledger-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+@contextmanager
+def account_lock(root: Path):
+    path = root / "logs" / "account.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SignalError("another Order Desk process is using this account") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
 
 
 def holdings_value(positions: Mapping[str, int], quotes: Mapping[str, Quote]) -> float:

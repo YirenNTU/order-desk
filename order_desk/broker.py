@@ -262,9 +262,14 @@ class ShioajiBroker:
         )
 
     def close(self) -> None:
-        if self.api is not None:
-            self.api.logout()
+        api = self.api
         self.api = None
+        if api is None:
+            return
+        try:
+            api.logout()
+        except Exception:
+            return
 
     def health(self) -> Mapping[str, Any]:
         account_id = str(getattr(self.account, "account_id", "")) if self.account else ""
@@ -406,6 +411,20 @@ class ShioajiBroker:
                     "status": str(trade.status.status).split(".")[-1],
                     "filled_quantity": int(getattr(trade.status, "deal_quantity", 0)),
                     "ticker": str(trade.contract.code),
+                    "action": str(trade.order.action).split(".")[-1],
+                    "order_lot": str(trade.order.order_lot).split(".")[-1],
+                    "quantity": int(trade.order.quantity),
+                    "limit_price": float(trade.order.price),
+                    "order_datetime": str(getattr(trade.status, "order_datetime", "")),
+                    "status_detail": {
+                        "code": str(getattr(trade.status, "status_code", "")),
+                        "message": str(getattr(trade.status, "msg", "")),
+                        "deals": [{"id": str(getattr(deal, "seq", "")),
+                                   "price": float(getattr(deal, "price", 0)),
+                                   "quantity": int(getattr(deal, "quantity", 0)),
+                                   "timestamp": str(getattr(deal, "datetime", getattr(deal, "ts", "")))}
+                                  for deal in getattr(trade.status, "deals", [])],
+                    },
                 }
             )
         return results
@@ -437,11 +456,18 @@ class BrokerWorker:
     def call(self, method: str, *args: Any, timeout: float = 65, **kwargs: Any) -> Any:
         future: Future[Any] = Future()
         self._queue.put((method, args, kwargs, future))
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except BrokerError:
+            raise
+        except Exception as exc:
+            raise BrokerError(f"{method} failed: {exc}") from exc
 
     def close(self) -> None:
         try:
             self.call("close", timeout=10)
+        except Exception:
+            pass
         finally:
             self._queue.put(None)
             self._thread.join(timeout=10)
