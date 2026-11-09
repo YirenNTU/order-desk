@@ -28,7 +28,7 @@ from order_desk.broker import BrokerError, BrokerWorker, ShioajiBroker
 from order_desk.capital import account_lock, atomic_json, TERMINAL_ORDER_STATUSES, load_account_ledger, save_account_ledger
 from order_desk.inventory import ReplanRequired, sync_quarantine, reconcile_actual_inventory
 from order_desk.deferrals import cycle_id, defer_restricted_orders, frozen_tickers, record_retry_checks
-from order_desk.execution import refresh_open_orders, prepare_next_day_execution, retry_terminal_orders, submit_sells_then_buys
+from order_desk.execution import cycle_already_completed, refresh_open_orders, prepare_next_day_execution, retry_terminal_orders, submit_sells_then_buys
 from order_desk.models import ExecutionPolicy, Quote
 from order_desk.planner import PlanningError, build_order_plan
 from order_desk.schedule import (
@@ -103,6 +103,11 @@ def main(argv: list[str] | None = None) -> int:
         args.confirm = "APPROVE"
     try:
         with account_lock(root):
+            if args.weekly_order:
+                saved, _ = load_account_ledger(root)
+                if cycle_already_completed(saved, cycle_id()):
+                    print('this cycle is already completed in the account ledger; no new orders')
+                    return 0
             return _run_account(args, config, root)
     except (OSError, sqlite3.Error, SignalError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -426,7 +431,7 @@ def _broker(mode: str) -> BrokerWorker:
 def _print_preview(preview: dict) -> None:
     cash = preview.get('cash_safety')
     if cash:
-        print(f"cash safety: {cash['status']}; available={cash.get('available_twd', 'unverified')}, required={cash.get('required_twd', 'unverified')}")
+        print(f"cash safety: {cash['status']}; bank_balance={cash.get('bank_balance_twd', 'unverified')}, settlement_buying_power={cash.get('available_twd', 'unverified')}, confirmed_receivables={cash.get('confirmed_receivable_credit_twd', 'unverified')}, required={cash.get('required_twd', 'unverified')}")
     plan = preview["plan"]
     for note in preview["notes"]:
         print(note)
@@ -477,7 +482,7 @@ def _print_open_orders(ledger: dict, confirmed: bool) -> None:
 def _print_submit_status(status: str, ledger: dict) -> None:
     if status == 'buys_waiting_for_cash':
         report = ledger.get('cash_safety', {})
-        print(f"cash safety: {report.get('status', 'unavailable')}; available={report.get('available_twd', 'unverified')}, required={report.get('required_twd', 'unverified')}, shortfall={report.get('shortfall_twd', 'unverified')}")
+        print(f"cash safety: {report.get('status', 'unavailable')}; bank_balance={report.get('bank_balance_twd', 'unverified')}, settlement_buying_power={report.get('available_twd', 'unverified')}, confirmed_receivables={report.get('confirmed_receivable_credit_twd', 'unverified')}, required={report.get('required_twd', 'unverified')}, shortfall={report.get('shortfall_twd', 'unverified')}")
         print(report.get('reason', 'funds unavailable'))
     messages = {
         "completed": "sells finished before buys; all orders are done",

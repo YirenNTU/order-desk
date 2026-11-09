@@ -42,7 +42,7 @@ def test_old_balance_or_broker_error_cannot_pass():
  with pytest.raises(SignalError):assess_cash(data,ledger(),[buy()],now=NOW)
 
 
-@pytest.mark.parametrize('amount,available',[(-500,500),(500,1000)])
+@pytest.mark.parametrize('amount,available',[(-500,500),(500,1500)])
 def test_unsettled_amounts_respect_receivable_and_payable_sign(amount,available):
  data=snapshot(1000);data['settlements'][1]['amount']=amount
  report=assess_cash(data,ledger(),[buy()],now=NOW)
@@ -171,14 +171,17 @@ def test_filled_buy_and_pending_buy_are_distinct_from_same_day_payable():
  assert report['available_twd']==760
 
 
-def test_confirmed_sale_offsets_same_day_filled_buy_but_is_not_bank_cash():
+def test_confirmed_sale_can_fund_new_same_settlement_buys_but_is_not_bank_cash():
  data=snapshot(2000)
  sell=dict(cash_order('sale','Filled',10),action='Sell')
  data['orders']=[cash_order('filled','Filled'),cash_order('pending'),sell]
  data['settlements'][2]['amount']=357
  report=assess_cash(data,ledger(),[],now=NOW)
  assert report['filled_net_payable_hold_twd']==0
- assert report['available_twd']==1380  # Bank less unfilled buy; no sale added.
+ assert report['bank_only_available_twd']==1380
+ assert report['available_twd']==1737
+ assert report['bank_balance_twd']==2000
+ assert report['today_confirmed_receivable_credit_twd']==357
 
 
 def test_pending_sell_never_funds_a_buy():
@@ -283,3 +286,58 @@ def test_broker_snapshot_uses_latest_modified_price_and_cancelled_quantity(monke
  b.api=NS(update_status=lambda a:None,list_trades=lambda:[t])
  row=b.reconcile_orders()[0]
  assert row['limit_price']==105 and row['cancelled_quantity']==2
+
+
+def test_confirmed_sale_can_fund_new_buy_when_bank_cash_is_zero():
+ data=snapshot(0);data['orders']=[dict(cash_order('sale','Filled',10),action='Sell')]
+ data['settlements'][2]['amount']=980
+ r=assess_cash(data,ledger(),[buy()],now=NOW)
+ assert r['status']=='allowed'
+ assert r['available_twd']==977  # 1000 minus commission buffer 20 and tax 3.
+ assert r['bank_only_available_twd']==0 and r['bank_balance_twd']==0
+
+
+def test_receipt_is_not_credited_twice_after_new_buy_fills():
+ data=snapshot(0);data['orders']=[dict(cash_order('sale','Filled',10),action='Sell'),cash_order('buy','Filled')]
+ data['settlements'][2]['amount']=380
+ r=assess_cash(data,ledger(),[buy()],now=NOW)
+ assert r['available_twd']==357 and r['status']=='insufficient'
+
+
+def test_receipt_reconciliation_uses_smaller_of_broker_and_confirmed_fills():
+ data=snapshot(0);data['orders']=[dict(cash_order('sale','Filled',10),action='Sell')]
+ data['settlements'][2]['amount']=500
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==500
+ data['settlements'][2]['amount']=2000
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==977
+
+
+def test_future_sale_receipt_does_not_cover_an_earlier_payment_deficit():
+ data=snapshot(100);data['settlements'][1]['amount']=-200
+ data['settlements'][2]['amount']=1000
+ data['orders']=[dict(cash_order('sale','Filled',20),action='Sell')]
+ r=assess_cash(data,ledger(),[buy()],now=NOW)
+ assert r['status']=='insufficient' and r['available_twd']==0
+ assert r['earlier_payment_shortfall_twd']==100
+
+
+def test_previous_days_confirmed_receipt_can_fund_later_new_buy():
+ data=snapshot(100);data['settlements'][1]['amount']=700
+ r=assess_cash(data,ledger(),[buy()],now=NOW)
+ assert r['status']=='allowed' and r['available_twd']==800
+ assert r['bank_balance_twd']==100
+
+
+def test_next_day_old_fills_are_not_added_again_to_rolled_settlement():
+ data=snapshot(0);data['settlements'][1]['amount']=700
+ old=dict(cash_order('sale','Filled',100),action='Sell',trading_day='2026-11-06')
+ data['orders']=[old];l=ledger();l['order_history']=[dict(old,shares=100,applied_shares=100)]
+ r=assess_cash(data,l,[buy()],now=NOW)
+ assert r['available_twd']==700 and r['confirmed_receivable_credit_twd']==700
+
+
+def test_unfilled_buy_against_receipt_reserved_before_new_buy():
+ data=snapshot(0);data['settlements'][2]['amount']=980
+ data['orders']=[dict(cash_order('sale','Filled',10),action='Sell'),cash_order('pending')]
+ r=assess_cash(data,ledger(),[buy()],now=NOW)
+ assert r['available_twd']==357 and r['status']=='insufficient'

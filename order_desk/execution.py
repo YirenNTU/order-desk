@@ -131,6 +131,18 @@ def prepare_next_day_execution(ledger, *, today=None):
     return True
 
 
+def cycle_already_completed(ledger, current_cycle):
+    """Durable completion survives a missing scheduler stamp or process crash."""
+    if ledger.get('execution') or ledger.get('open_orders'):
+        return False
+    history = ledger.get('execution_history', [])
+    if not history:
+        return False
+    last = history[-1]
+    return (last.get('cycle_id') == current_cycle
+            and last.get('outcome') in {'completed', 'completed_with_deferrals'})
+
+
 def _placed_before_today(order: Mapping[str, Any], today: str) -> bool:
     placed_on = str(order.get("trading_day", ""))
     return bool(placed_on) and placed_on < today

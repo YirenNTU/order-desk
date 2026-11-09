@@ -143,3 +143,63 @@ def test_resume_command_installs_then_enables_and_checks_once(tmp_path, monkeypa
     assert cli.main(['--config',str(path),'--resume-schedule','--confirm','APPROVE']) == 0
     assert calls == [True]
     assert json.loads(path.read_text())['schedule']['enabled'] is True
+
+
+@pytest.mark.parametrize('inventory_short',[False,True])
+def test_partial_prior_day_buy_retries_only_remaining_target_once(tmp_path,monkeypatch,inventory_short):
+    from order_desk.books import load_strategy_entries,signal_signature
+    from order_desk.deferrals import cycle_id
+    cli,fake,args=fixture(tmp_path,monkeypatch,initial_short=False)
+    config=json.loads((tmp_path/'config.json').read_text());config['inventory_mismatch_policy']='reconcile_actual'
+    (tmp_path/'config.json').write_text(json.dumps(config))
+    saved,paths=load_account_ledger(tmp_path)
+    old=(datetime.fromisoformat(taipei_today())-timedelta(days=1)).date().isoformat()
+    saved['strategies']={'alpha':{'6213':10,'2330':5}}
+    order=_open_buy(old);order.update(ticker='2317',shares=5,limit_price=100,
+        allocation=[{'strategy':'alpha','shares':5,'applied':0}])
+    order['broker_snapshot']={'broker_order_id':'abc','ticker':'2317','action':'Buy',
+        'order_lot':'IntradayOdd','status':'Cancelled','filled_shares':2,'trading_day':old}
+    saved['open_orders']=[order]
+    saved['execution']={'trading_day':old,'cycle_id':cycle_id(),'budgets':{'alpha':2000},
+        'targets':{'alpha':{'6213':10,'2330':5,'2317':5}},
+        'signal_signature':signal_signature(load_strategy_entries(config,tmp_path)),
+        'orders':[],'allocations':{},'submitted':[]}
+    fake._positions={'6213':5 if inventory_short else 10,'2330':5,'2317':2}
+    save_account_ledger(tmp_path,saved,paths)
+    assert cli.main(args)==0
+    after,_=load_account_ledger(tmp_path)
+    expected={'6213':7,'2330':3,'2317':3} if inventory_short else {'6213':10,'2330':5,'2317':5}
+    assert after['strategies']['alpha']==expected
+    if inventory_short:
+        assert after['inventory_adjustment_history'][-1]['strategy_after']=={'alpha':5}
+        assert sorted((o['ticker'],o['action'],o['shares']) for o in fake.orders.values())==[('2317','Buy',1),('2330','Sell',2),('6213','Buy',2)]
+    else:
+        assert [(o['ticker'],o['action'],o['shares']) for o in fake.orders.values()]==[('2317','Buy',3)]
+    count=len(fake.orders)
+    # Simulate a scheduler retry after its external completion stamp was lost.
+    monkeypatch.setattr(cli,'_refuse_weekly_order',lambda *a:0)
+    assert cli.main(['--config',str(tmp_path/'config.json'),'--weekly-order'])==0
+    assert len(fake.orders)==count
+    assert len([o for o in load_account_ledger(tmp_path)[0]['order_history'] if o['broker_order_id']=='abc'])==1
+
+
+def test_tuesday_schedule_retries_working_monday_without_retrying_complete(tmp_path):
+    from order_desk.schedule import due_actions,schedule_slots,write_order_stamp,order_stamp_blocks_retry
+    now=datetime(2026,11,10,9,20,tzinfo=ZoneInfo('Asia/Taipei'))
+    stamp=tmp_path/'last_order.json'
+    write_order_stamp(stamp,week='2026-11-09',trading_day='2026-11-09',status='working')
+    done=order_stamp_blocks_retry(stamp,now.date())
+    assert due_actions(now,schedule_slots({}),pull_done=True,order_done=done,is_trading_day=lambda d:True)==['order']
+    write_order_stamp(stamp,week='2026-11-09',trading_day='2026-11-10',status='completed')
+    assert due_actions(now,schedule_slots({}),pull_done=True,order_done=order_stamp_blocks_retry(stamp,now.date()),is_trading_day=lambda d:True)==[]
+
+
+def test_completion_guard_does_not_hide_active_work_or_next_cycle():
+    from order_desk.execution import cycle_already_completed
+    l={'execution_history':[{'cycle_id':'2026-11-09','outcome':'completed'}]}
+    assert cycle_already_completed(l,'2026-11-09')
+    assert not cycle_already_completed(l,'2026-11-16')
+    l['execution']={'trading_day':'2026-11-10'}
+    assert not cycle_already_completed(l,'2026-11-09')
+    del l['execution'];l['open_orders']=[{'status':'Unconfirmed'}]
+    assert not cycle_already_completed(l,'2026-11-09')

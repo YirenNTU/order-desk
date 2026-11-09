@@ -165,22 +165,46 @@ def assess_cash(snapshot, ledger, orders, *, reserve=0.0, fee_rate=0.001425, min
             filled_sales += proceeds
             details.append({'broker_order_id': key, 'action': action, 'filled_shares': filled,
                             'confirmed_proceeds_floor_twd': proceeds})
-    # Shioaji signed amounts: positive receivable, negative payable. Never use
-    # abs(), and never add a receivable to the current bank balance. The broker
-    # T+2 net and our fill-derived net describe the same fills: take the larger
-    # payable, then ADD only unfilled buy commitments (not the filled buys again).
-    earlier_hold = sum(max(0.0, -settlements.get(t, 0)) for t in (0, 1))
-    broker_payable = max(0.0, -settlements.get(2, 0))
-    estimated_payable = max(0.0, filled_buys - filled_sales)
-    filled_hold = max(broker_payable, estimated_payable)
+    # Project payment capacity by settlement date, rather than treating sale
+    # receivables as bank deposits. T0 postings are ambiguous: reserve any debit
+    # unless the broker no longer reports it; never credit T0 receipts twice.
+    t0_hold = max(0.0, -settlements.get(0, 0))
+    t1_net = settlements.get(1, 0)
+    broker_net = settlements.get(2, 0)
+    estimated_net = filled_sales - filled_buys
+    # Both observations describe today's fills. Choose the lower signed net:
+    # larger payable or smaller confirmed receipt, never sum the two sources.
+    confirmed_net = min(broker_net, estimated_net)
+    broker_payable = max(0.0, -broker_net)
+    filled_hold = max(0.0, -confirmed_net)
+    today_receivable = max(0.0, confirmed_net)
+    earlier_hold = t0_hold + max(0.0, -t1_net)
     today_hold = filled_hold + pending_buys
-    available = max(0.0, bank - reserve - earlier_hold - today_hold)
+    bank_only_available = max(0.0, bank - reserve - earlier_hold - today_hold)
+    after_t0 = bank - reserve - t0_hold
+    after_t1 = after_t0 + t1_net
+    earlier_shortfall = max(0.0, -after_t0, -after_t1)
+    after_t2 = after_t1 + confirmed_net - pending_buys
+    # New buys settle on T+2. A receipt on that date can offset those buys, but
+    # cannot cure an uncovered payment on T0 or T+1.
+    available = max(0.0, after_t2) if earlier_shortfall == 0 else 0.0
+    timeline = [
+        {'T': 0, 'date': dates_by_t.get(0, today), 'net_flow_twd': -t0_hold, 'balance_twd': after_t0},
+        {'T': 1, 'date': dates_by_t.get(1), 'net_flow_twd': t1_net, 'balance_twd': after_t1},
+        {'T': 2, 'date': dates_by_t.get(2), 'net_flow_twd': confirmed_net - pending_buys, 'balance_twd': after_t2},
+    ]
     required = sum(buy_cost(o.estimated_notional, fee_rate, minimum_fee) for o in orders if o.action == 'Buy')
-    return {'checked_at': now.isoformat(), 'status': 'allowed' if required <= available else 'insufficient',
+    return {'checked_at': now.isoformat(), 'status': 'allowed' if required <= available and earlier_shortfall == 0 else 'insufficient',
             'bank_balance_twd': bank, 'earlier_settlement_hold_twd': earlier_hold,
             'today_commitment_hold_twd': today_hold, 'cash_reserve_twd': reserve,
             'available_twd': available, 'required_twd': required,
-            'shortfall_twd': max(0.0, required - available),
+            'shortfall_twd': max(earlier_shortfall, required - available, 0.0),
+            'bank_only_available_twd': bank_only_available,
+            'settlement_buying_power_twd': available,
+            'earlier_payment_shortfall_twd': earlier_shortfall,
+            'confirmed_receivable_credit_twd': max(0.0, t1_net) + today_receivable,
+            'today_confirmed_receivable_credit_twd': today_receivable,
+            'settlement_timeline': timeline,
             'settlement_amounts_twd': {str(t): v for t, v in settlements.items()},
             'settlement_receivables_twd': sum(max(0.0, v) for v in settlements.values()),
             'broker_today_payable_twd': broker_payable,
@@ -190,7 +214,7 @@ def assess_cash(snapshot, ledger, orders, *, reserve=0.0, fee_rate=0.001425, min
             'unfilled_buy_hold_twd': pending_buys,
             'order_commitments': details,
             'today_settlement_status_unverified': settlements.get(0, 0) < 0,
-            'reason': 'signed payables plus unfilled buys; filled net counted once; receivables not debited or added to bank cash'}
+            'reason': 'settlement-date buying power includes confirmed receipts once; earlier payments must remain covered; unfilled sells never credited'}
 
 
 def check_cash(worker, ledger, orders, **options):
