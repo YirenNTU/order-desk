@@ -13,11 +13,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
+from order_desk.validation import nonnegative_integer, validate_intent
+from order_desk.calendar import TwseCalendar
+from order_desk.schedule import taipei_now, within_order_session
 from order_desk.models import BrokerPosition, OrderIntent, Quote
 
 
 class BrokerError(RuntimeError):
     """Broker connection or order operation failed."""
+
+
+class OrderNotSubmitted(BrokerError):
+    """Local validation rejected the intent before the broker API was called."""
+
+
+def _enum_value(value):
+    return str(getattr(value, 'value', value))
 
 
 @dataclass(frozen=True)
@@ -176,6 +187,7 @@ class ShioajiBroker:
         self,
         mode: str = "simulation",
         event_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        calendar_path: Path | None = None,
     ):
         if mode not in {"simulation", "production"}:
             raise BrokerError("Shioaji mode must be simulation or production")
@@ -183,6 +195,7 @@ class ShioajiBroker:
             raise BrokerError("production is locked by TRADING_ALLOW_PRODUCTION")
         self.mode = mode
         self.event_sink = event_sink
+        self.calendar_path = calendar_path or Path.cwd() / 'logs' / 'twse-holidays.json'
         self.api: Any = None
         self.account: Any = None
         self._trades: dict[str, Any] = {}
@@ -287,18 +300,16 @@ class ShioajiBroker:
         import shioaji as sj
 
         values = self.api.list_positions(account=self.account, unit=sj.Unit.Share)
-        return [
-            BrokerPosition(ticker=str(value.code), shares=int(value.quantity))
-            for value in values
-            if str(
-                getattr(
-                    getattr(value, "direction", "Buy"),
-                    "value",
-                    getattr(value, "direction", "Buy"),
-                )
-            ).lower()
-            == "buy"
-        ]
+        result = []
+        for value in values:
+            condition = str(getattr(getattr(value, 'cond', None), 'value', getattr(value, 'cond', '')))
+            direction = str(getattr(getattr(value, 'direction', None), 'value', getattr(value, 'direction', '')))
+            if not condition or direction not in {'Buy', 'Sell'}:
+                raise BrokerError('position cash condition/direction cannot be verified')
+            if condition != 'Cash' or direction != 'Buy':
+                continue
+            result.append(BrokerPosition(ticker=str(value.code), shares=nonnegative_integer(value.quantity, 'position shares')))
+        return result
 
     def available_cash(self) -> float:
         if self.api is None:
@@ -322,6 +333,10 @@ class ShioajiBroker:
             raise BrokerError(f"contract not found: {ticker}") from exc
         if contract is None or getattr(contract, "limit_up", None) in (None, 0):
             raise BrokerError(f"contract not found: {ticker}")
+        if (_enum_value(getattr(contract, 'security_type', '')) != 'STK'
+                or _enum_value(getattr(contract, 'exchange', '')) not in {'TSE', 'OTC'}
+                or float(getattr(contract, 'unit', 0)) != 1000):
+            raise BrokerError(f'{ticker}: unsupported market or trading unit; only TSE/OTC 1000-share cash stocks supported')
         return contract
 
     def quotes(self, tickers: list[str]) -> dict[str, Quote]:
@@ -329,8 +344,17 @@ class ShioajiBroker:
             raise BrokerError("broker is not connected")
         contracts = [self._stock_contract(ticker) for ticker in tickers]
         snapshots = self.api.snapshots(contracts)
+        by_code = {}
+        for snapshot in snapshots:
+            code = str(getattr(snapshot, 'code', ''))
+            if not code or code in by_code:
+                raise BrokerError('missing or duplicate snapshot symbol')
+            by_code[code] = snapshot
+        if set(by_code) != {str(contract.code) for contract in contracts}:
+            raise BrokerError('snapshot symbols do not match requested contracts')
         result: dict[str, Quote] = {}
-        for contract, snapshot in zip(contracts, snapshots):
+        for contract in contracts:
+            snapshot = by_code[str(contract.code)]
             bid = float(snapshot.buy_price)
             ask = float(snapshot.sell_price)
             last = float(snapshot.close)
@@ -351,28 +375,38 @@ class ShioajiBroker:
         return result
 
     def place_order(self, intent: OrderIntent) -> BrokerOrderResult:
-        if self.api is None:
-            raise BrokerError("broker is not connected")
-        import shioaji as sj
+        try:
+            if self.api is None:
+                raise BrokerError("broker is not connected")
+            import shioaji as sj
 
-        if self.mode == "production" and os.getenv("TRADING_ALLOW_PRODUCTION") != self.PRODUCTION_CONFIRMATION:
-            raise BrokerError("production lock changed; refusing order")
-        contract = self._stock_contract(intent.ticker)
-        order = sj.StockOrder(
-            action=sj.Action.Buy if intent.action == "Buy" else sj.Action.Sell,
-            price=intent.limit_price,
-            quantity=intent.broker_quantity,
-            price_type=sj.StockPriceType.LMT,
-            order_type=sj.OrderType.ROD,
-            order_lot=(
-                sj.StockOrderLot.Common
-                if intent.order_lot == "Common"
-                else sj.StockOrderLot.IntradayOdd
-            ),
-            order_cond=sj.StockOrderCond.Cash,
-            account=self.account,
-            custom_field=intent.client_order_id[:6],
-        )
+            if self.mode == "production" and os.getenv("TRADING_ALLOW_PRODUCTION") != self.PRODUCTION_CONFIRMATION:
+                raise BrokerError("production lock changed; refusing order")
+            validate_intent(intent)
+            if self.mode == 'production':
+                now = taipei_now()
+                if not within_order_session(now) or not TwseCalendar(self.calendar_path).is_trading_day(now.date()):
+                    raise BrokerError('outside the configured Taiwan order session; order not submitted')
+            contract = self._stock_contract(intent.ticker)
+            if not float(contract.limit_down) <= intent.limit_price <= float(contract.limit_up):
+                raise BrokerError('saved limit price is outside current daily limits; replan required')
+            order = sj.StockOrder(
+                action=sj.Action.Buy if intent.action == "Buy" else sj.Action.Sell,
+                price=intent.limit_price,
+                quantity=intent.broker_quantity,
+                price_type=sj.StockPriceType.LMT,
+                order_type=sj.OrderType.ROD,
+                order_lot=(
+                    sj.StockOrderLot.Common
+                    if intent.order_lot == "Common"
+                    else sj.StockOrderLot.IntradayOdd
+                ),
+                order_cond=sj.StockOrderCond.Cash,
+                account=self.account,
+                custom_field=intent.client_order_id[:6],
+            )
+        except Exception as exc:
+            raise OrderNotSubmitted(str(exc)) from exc
         trade = self.api.place_order(contract, order)
         broker_id = str(trade.order.id)
         self._trades[broker_id] = trade
@@ -380,7 +414,7 @@ class ShioajiBroker:
         return BrokerOrderResult(
             broker_order_id=broker_id,
             status=str(trade.status.status).split(".")[-1],
-            filled_shares=int(getattr(trade.status, "deal_quantity", 0))
+            filled_shares=nonnegative_integer(getattr(trade.status, "deal_quantity", 0), "immediate broker fill")
             * (1000 if intent.order_lot == "Common" else 1),
         )
 
@@ -404,16 +438,28 @@ class ShioajiBroker:
         self.api.update_status(self.account)
         results = []
         for trade in self.api.list_trades():
+            account = getattr(trade.order, 'account', None)
+            if account is None or any(not getattr(account, field, None) for field in ('account_id', 'broker_id')):
+                raise BrokerError('broker trade account cannot be verified')
+            if any(str(getattr(account, field, '')) != str(getattr(self.account, field, '')) for field in ('account_id', 'broker_id')):
+                continue
+            if _enum_value(getattr(trade.contract, 'security_type', '')) != 'STK':
+                continue
+            condition = str(getattr(trade.order, 'order_cond', '')).split('.')[-1]
+            if not condition:
+                raise BrokerError('broker trade cash condition cannot be verified')
+            if condition != 'Cash':
+                continue
             results.append(
                 {
                     "broker_order_id": str(trade.order.id),
                     "custom_field": str(getattr(trade.order, "custom_field", "")),
                     "status": str(trade.status.status).split(".")[-1],
-                    "filled_quantity": int(getattr(trade.status, "deal_quantity", 0)),
+                    "filled_quantity": nonnegative_integer(getattr(trade.status, "deal_quantity", 0), "broker filled quantity"),
                     "ticker": str(trade.contract.code),
                     "action": str(trade.order.action).split(".")[-1],
                     "order_lot": str(trade.order.order_lot).split(".")[-1],
-                    "quantity": int(trade.order.quantity),
+                    "quantity": nonnegative_integer(trade.order.quantity, "broker order quantity"),
                     "limit_price": float(trade.order.price),
                     "order_datetime": str(getattr(trade.status, "order_datetime", "")),
                     "status_detail": {

@@ -92,21 +92,14 @@ def _orders_for_delta(
     if not odd_lots_enabled and shares % 1000:
         raise PlanningError(f"{ticker}: non-round-lot delta in common-lot mode")
     intents: list[OrderIntent] = []
-    if common_shares:
-        intents.append(
-            OrderIntent(
-                client_order_id=_client_order_id(
-                    bundle_id, revision, ticker, action, "Common"
-                ),
-                ticker=ticker,
-                action=action,
-                shares=common_shares,
-                broker_quantity=common_shares // 1000,
-                order_lot="Common",
-                limit_price=limit_price,
-                estimated_notional=round(common_shares * limit_price, 2),
-            )
-        )
+    for index, offset in enumerate(range(0, common_shares, 499_000)):
+        chunk = min(499_000, common_shares - offset)
+        lot_key = 'Common' if common_shares <= 499_000 else f'Common:{index}'
+        intents.append(OrderIntent(
+            client_order_id=_client_order_id(bundle_id, revision, ticker, action, lot_key),
+            ticker=ticker, action=action, shares=chunk, broker_quantity=chunk // 1000,
+            order_lot='Common', limit_price=limit_price,
+            estimated_notional=round(chunk * limit_price, 2)))
     if odd_shares:
         intents.append(
             OrderIntent(

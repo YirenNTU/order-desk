@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from collections import defaultdict
-from order_desk.capital import combined_shares, atomic_json
+from order_desk.capital import combined_shares, atomic_json, quantity_to_shares
 from order_desk.signal import SignalError
 
 
@@ -23,15 +23,8 @@ def _key(row):
 
 
 def _fills(row):
-    if 'filled_shares' in row:
-        value = row['filled_shares']
-        multiplier = 1
-    else:
-        value = row.get('filled_quantity', 0)
-        multiplier = 1000 if row.get('order_lot') == 'Common' else 1
-    if isinstance(value, bool) or int(value) != float(value) or int(value) < 0:
-        raise SignalError('invalid cumulative fill quantity in broker observation')
-    return int(value) * multiplier
+    from order_desk.capital import filled_shares
+    return filled_shares(row, row.get('order_lot', 'IntradayOdd'))
 
 
 def _baseline(report):
@@ -137,7 +130,7 @@ def audit_account(worker, ledger, *, tickers=(), baseline=None, observed_orders=
             if (key in live_keys or row['observed_trading_day'] == current_day) and ticker in relevant and status not in {'Filled', 'Cancelled', 'Failed'}:
                 action = str(row.get('action', '')).split('.')[-1]
                 if action == 'Sell' and 'quantity' in row:
-                    total = int(row['quantity']) * (1000 if row.get('order_lot') == 'Common' else 1)
+                    total = quantity_to_shares(row['quantity'], row.get('order_lot'))
                     reserved[ticker] += max(0, total - _fills(row))
                 elif action != 'Buy':
                     blockers.append(f'{ticker}: active external sell quantity/direction cannot be verified')

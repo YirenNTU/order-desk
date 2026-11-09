@@ -71,7 +71,7 @@ def test_missing_holiday_calendar_does_not_treat_a_weekday_as_open(tmp_path: Pat
     cache.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "source": TWSE_HOLIDAY_URL,
                 "year": 2026,
                 "fetched_at": "2026-01-01T00:00:00Z",

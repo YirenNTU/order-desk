@@ -50,7 +50,7 @@ class TwseCalendar:
             return None
         if (
             not isinstance(value, dict)
-            or value.get("schema_version") != 1
+            or value.get("schema_version") != 2
             or value.get("source") != TWSE_HOLIDAY_URL
             or not isinstance(value.get("year"), int)
             or not isinstance(value.get("holidays"), list)
@@ -71,6 +71,7 @@ class TwseCalendar:
         if not isinstance(payload, list) or not payload:
             raise CalendarUnavailable("TWSE holiday API returned no rows")
         holidays: set[str] = set()
+        trading_days: set[str] = set()
         for row in payload:
             if not isinstance(row, dict):
                 raise CalendarUnavailable("TWSE holiday API returned an invalid row")
@@ -80,13 +81,20 @@ class TwseCalendar:
             parsed = _holiday_date(raw_date, year)
             if parsed.year != year:
                 raise CalendarUnavailable(f"TWSE holiday response is for {parsed.year}, not {year}")
-            holidays.add(parsed.isoformat())
+            text = str(row.get('Name') or row.get('name') or '') + str(row.get('Description') or '')
+            closed = any(word in text for word in ('無交易', '停止交易', '休市'))
+            open_marker = any(word in text for word in ('開始交易', '最後交易', '恢復交易', '照常交易', '補行交易'))
+            if open_marker and not closed:
+                trading_days.add(parsed.isoformat())
+            else:
+                holidays.add(parsed.isoformat())
         value = {
-            "schema_version": 1,
+            "schema_version": 2,
             "source": TWSE_HOLIDAY_URL,
             "year": year,
             "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "holidays": sorted(holidays),
+            "trading_days": sorted(trading_days),
         }
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(dir=self.cache_path.parent)
@@ -106,7 +114,7 @@ class TwseCalendar:
         return self.refresh(year)
 
     def is_trading_day(self, value: date) -> bool:
-        if value.weekday() >= 5:
-            return False
         calendar = self.ensure_year(value.year)
-        return value.isoformat() not in set(calendar["holidays"])
+        if value.isoformat() in calendar.get('trading_days', []):
+            return True
+        return value.weekday() < 5 and value.isoformat() not in set(calendar['holidays'])

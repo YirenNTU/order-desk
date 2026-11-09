@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from order_desk.broker import BrokerError
+from order_desk.broker import BrokerError, OrderNotSubmitted
 from order_desk.inventory import ReplanRequired
 from order_desk.deferrals import cycle_id, frozen_tickers
 
@@ -22,6 +22,7 @@ from order_desk.capital import (
 )
 from order_desk.models import OrderIntent
 from order_desk.signal import SignalError
+from order_desk.validation import validate_allocations, nonnegative_integer
 
 
 def taipei_today() -> str:
@@ -75,6 +76,8 @@ def _refresh_orders(worker, ledger, *, today=None):
         for key in ("ticker", "action", "order_lot"):
             if key in row and str(row[key]).split(".")[-1] != str(order[key]):
                 raise SignalError(f"{order['ticker']}: broker order identity mismatch ({key})")
+        if row.get('custom_field') and order.get('custom_field') and row['custom_field'] != order['custom_field']:
+            raise SignalError('broker order custom identity mismatch')
         row_day = str(row.get('trading_day') or row.get('order_datetime') or '')[:10]
         if row_day and row_day != order.get("trading_day"):
             raise SignalError("broker order trading day mismatch")
@@ -157,13 +160,11 @@ def submit_sells_then_buys(
         orders = [OrderIntent(**row) for row in pending["orders"]]
         allocations = pending["allocations"]
     else:
-        for order in orders:
-            legs = allocations.get(order.client_order_id, [])
-            if not legs or sum(int(leg["shares"]) for leg in legs) != order.shares or any(int(leg["shares"]) <= 0 for leg in legs):
-                raise SignalError(f"{order.ticker}: invalid strategy allocation")
+        validate_allocations(orders, allocations)
         pending = {"trading_day": taipei_today(), "orders": [asdict(o) for o in orders],
                    "allocations": copy.deepcopy(allocations), "submitted": []}
         ledger["execution"] = pending
+    validate_allocations(orders, allocations, pending['submitted'])
     if any(order.ticker in ledger.get('inventory_quarantine', {}) for order in orders):
         ledger['execution']['reweight_required'] = True
         raise ReplanRequired('saved orders include quarantined inventory; rebuild the remaining plan')
@@ -234,6 +235,15 @@ def _submit_one(worker, ledger, order, allocations, pending, remember):
     remember()  # Must succeed before the broker can receive the order.
     try:
         result = worker.call("place_order", replace(order, client_order_id=token))
+    except OrderNotSubmitted as exc:
+        tracked['status'] = 'NotSubmitted'
+        tracked['local_rejection_reason'] = str(exc)
+        ledger['open_orders'].remove(tracked)
+        pending['submitted'].remove(order.client_order_id)
+        ledger.setdefault('local_rejection_history', []).append(copy.deepcopy(tracked))
+        pending['reweight_required'] = True
+        remember()
+        raise
     except Exception:
         tracked["status"] = "SubmissionUnknown"
         remember()
@@ -245,7 +255,7 @@ def _submit_one(worker, ledger, order, allocations, pending, remember):
     tracked["broker_order_id"] = str(result.broker_order_id)
     tracked["status"] = str(result.status).split(".")[-1]
     # Record an immediate fill even if the following status query disconnects.
-    filled = int(getattr(result, "filled_shares", 0))
+    filled = nonnegative_integer(getattr(result, "filled_shares", 0), "immediate fill")
     if filled:
         if filled < 0 or filled > order.shares:
             raise SignalError("invalid immediate broker fill")

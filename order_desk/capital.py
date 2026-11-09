@@ -19,6 +19,7 @@ from typing import Any, Mapping
 from order_desk.models import Quote
 from order_desk.planner import _price_for_size
 from order_desk.signal import SignalError
+from order_desk.validation import nonnegative_integer
 
 TERMINAL_ORDER_STATUSES = {"Filled", "Cancelled", "Failed"}
 
@@ -279,9 +280,16 @@ def apply_fill(positions: dict[str, int], ticker: str, action: str, shares: int)
 
 def filled_shares(row: Mapping[str, Any], order_lot: str) -> int:
     if "filled_shares" in row:
-        return int(row["filled_shares"])
-    quantity = int(row.get("filled_quantity", 0))
-    return quantity * 1000 if order_lot == "Common" else quantity
+        return nonnegative_integer(row["filled_shares"], "filled shares")
+    return quantity_to_shares(row.get('filled_quantity', 0), order_lot)
+
+
+def quantity_to_shares(quantity, order_lot):
+    quantity = nonnegative_integer(quantity, 'broker quantity')
+    lot = str(getattr(order_lot, 'value', order_lot)).split('.')[-1]
+    if lot not in {'Common', 'Fixing', 'Odd', 'IntradayOdd'}:
+        raise SignalError('unknown stock lot: cannot determine share units')
+    return quantity * 1000 if lot in {'Common', 'Fixing'} else quantity
 
 
 def _nonnegative(name: str, label: str, value: float) -> float:
