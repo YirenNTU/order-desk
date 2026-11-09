@@ -489,7 +489,8 @@ class ShioajiBroker:
                     "action": str(trade.order.action).split(".")[-1],
                     "order_lot": str(trade.order.order_lot).split(".")[-1],
                     "quantity": nonnegative_integer(trade.order.quantity, "broker order quantity"),
-                    "limit_price": float(trade.order.price),
+                    "limit_price": float(getattr(trade.status, "modified_price", 0) or trade.order.price),
+                    "cancelled_quantity": nonnegative_integer(getattr(trade.status, "cancel_quantity", 0), "broker cancelled quantity"),
                     "order_datetime": str(getattr(trade.status, "order_datetime", "")),
                     "status_detail": {
                         "code": str(getattr(trade.status, "status_code", "")),

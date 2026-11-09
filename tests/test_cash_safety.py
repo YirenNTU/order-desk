@@ -42,11 +42,11 @@ def test_old_balance_or_broker_error_cannot_pass():
  with pytest.raises(SignalError):assess_cash(data,ledger(),[buy()],now=NOW)
 
 
-@pytest.mark.parametrize('amount',[-500,500])
-def test_unsettled_amounts_reserved_without_crediting_future_sales(amount):
+@pytest.mark.parametrize('amount,available',[(-500,500),(500,1000)])
+def test_unsettled_amounts_respect_receivable_and_payable_sign(amount,available):
  data=snapshot(1000);data['settlements'][1]['amount']=amount
  report=assess_cash(data,ledger(),[buy()],now=NOW)
- assert report['available_twd']==500 and report['status']=='insufficient'
+ assert report['available_twd']==available
 
 
 def cash_order(key='manual',status='Submitted',shares=6):
@@ -149,3 +149,137 @@ def test_partial_cancel_reserves_only_confirmed_filled_shares():
  report=assess_cash(data,ledger(),[buy()],now=NOW)
  assert report['today_commitment_hold_twd']==220
  assert report['status']=='allowed'
+
+
+def test_receivable_and_pending_buys_are_not_combined_as_two_payables():
+ data=snapshot(180000)
+ data['settlements'][1]['amount']=-130000
+ data['settlements'][2]['amount']=100000
+ data['orders']=[cash_order('pending',shares=300)]
+ report=assess_cash(data,ledger(),[],now=NOW)
+ assert report['available_twd']==19957
+ assert report['filled_net_payable_hold_twd']==0
+ assert report['unfilled_buy_hold_twd']==30043
+
+
+def test_filled_buy_and_pending_buy_are_distinct_from_same_day_payable():
+ data=snapshot(2000)
+ data['settlements'][2]['amount']=-620
+ data['orders']=[cash_order('filled','Filled'),cash_order('pending')]
+ report=assess_cash(data,ledger(),[],now=NOW)
+ assert report['today_commitment_hold_twd']==1240
+ assert report['available_twd']==760
+
+
+def test_confirmed_sale_offsets_same_day_filled_buy_but_is_not_bank_cash():
+ data=snapshot(2000)
+ sell=dict(cash_order('sale','Filled',10),action='Sell')
+ data['orders']=[cash_order('filled','Filled'),cash_order('pending'),sell]
+ data['settlements'][2]['amount']=357
+ report=assess_cash(data,ledger(),[],now=NOW)
+ assert report['filled_net_payable_hold_twd']==0
+ assert report['available_twd']==1380  # Bank less unfilled buy; no sale added.
+
+
+def test_pending_sell_never_funds_a_buy():
+ data=snapshot(1000)
+ data['orders']=[dict(cash_order('sale',shares=100),action='Sell'),cash_order('buy','Filled')]
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==380
+
+
+def test_partial_fill_reserves_filled_and_remaining_once_with_one_fee():
+ data=snapshot(2000);row=cash_order(shares=10);row['filled_shares']=2
+ data['orders']=[row];data['settlements'][2]['amount']=-220
+ report=assess_cash(data,ledger(),[],now=NOW)
+ assert report['filled_net_payable_hold_twd']==220
+ assert report['unfilled_buy_hold_twd']==800
+ assert report['today_commitment_hold_twd']==1020
+
+
+@pytest.mark.parametrize('remote_status,expected',[('Cancelled',1000),('Filled',380)])
+def test_authoritative_remote_terminal_releases_stale_local_open_hold(remote_status,expected):
+ data=snapshot(1000);data['orders']=[cash_order('same',remote_status)]
+ l=ledger();l['open_orders']=[dict(cash_order('same'),shares=6,applied_shares=0)]
+ assert assess_cash(data,l,[],now=NOW)['available_twd']==expected
+
+
+def test_lagging_settlement_still_reserves_confirmed_buy():
+ data=snapshot(1000);data['settlements'][2]['amount']=300
+ data['orders']=[cash_order('buy','Filled')]
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==380
+
+
+def test_market_filled_order_uses_confirmed_deal_price():
+ data=snapshot(1000);row=cash_order('buy','Filled');row['limit_price']=0
+ row['status_detail']={'deals':[{'price':90,'quantity':6}]};data['orders']=[row]
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==440
+
+
+def test_missing_fill_detail_cannot_value_market_order():
+ data=snapshot();row=cash_order('buy','Filled');row['limit_price']=0;data['orders']=[row]
+ with pytest.raises(SignalError):assess_cash(data,ledger(),[],now=NOW)
+
+
+def test_actual_fill_price_prevents_using_lower_modified_limit_for_past_fills():
+ data=snapshot(1000);row=cash_order('buy','Filled');row['limit_price']=50
+ row['status_detail']={'deals':[{'price':100,'quantity':6}]};data['orders']=[row]
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==380
+
+
+def test_same_order_local_fill_regression_is_not_silently_ignored():
+ data=snapshot();data['orders']=[cash_order()];l=ledger()
+ l['open_orders']=[dict(cash_order(),shares=6,applied_shares=2)]
+ with pytest.raises(SignalError,match='backwards'):assess_cash(data,l,[],now=NOW)
+
+
+def test_later_receipt_cannot_pay_earlier_obligation():
+ data=snapshot(1000);data['settlements'][1]['amount']=-700
+ data['settlements'][2]['amount']=10000
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==300
+
+
+def test_today_receivable_is_neither_reserved_nor_added_to_balance():
+ data=snapshot(1000);data['settlements'][0]['amount']=10000
+ assert assess_cash(data,ledger(),[],now=NOW)['available_twd']==1000
+
+
+def test_today_payable_with_unknown_bank_posting_is_explicit():
+ data=snapshot();data['settlements'][0]['amount']=-200
+ r=assess_cash(data,ledger(),[],now=NOW)
+ assert r['available_twd']==800 and r['today_settlement_status_unverified']
+
+
+def test_partial_quantity_reduction_releases_only_cancelled_unfilled_shares():
+ data=snapshot(2000);row=cash_order(shares=10)
+ row.update(filled_shares=2,cancelled_quantity=3);data['orders']=[row]
+ r=assess_cash(data,ledger(),[],now=NOW)
+ assert r['filled_net_payable_hold_twd']==220
+ assert r['unfilled_buy_hold_twd']==500
+ assert r['available_twd']==1280
+
+
+def test_missing_sale_valuation_is_not_credited_as_cash():
+ data=snapshot();sell=dict(cash_order('sale','Filled'),action='Sell')
+ del sell['limit_price'];data['orders']=[sell]
+ r=assess_cash(data,ledger(),[],now=NOW)
+ assert r['estimated_confirmed_sale_proceeds_twd']==0
+ assert r['available_twd']==1000
+
+
+def test_common_local_fill_and_cancel_units_are_normalized_once():
+ l=ledger();l['open_orders']=[dict(cash_order('local',shares=10),order_lot='Common',
+  shares=10000,applied_shares=2000,broker_snapshot={'cancelled_quantity':3,
+   'status_detail':{'deals':[{'price':90,'quantity':2}]}})]
+ r=assess_cash(snapshot(1000000),l,[],now=NOW)
+ assert r['order_commitments'][0]['remaining_shares']==5000
+ assert r['order_commitments'][0]['filled_cost_twd']==buy_cost(180000)
+ assert r['today_commitment_hold_twd']==buy_cost(680000)
+
+
+def test_broker_snapshot_uses_latest_modified_price_and_cancelled_quantity(monkeypatch):
+ from test_taiwan_review import adapter,trade,NS
+ b=adapter(monkeypatch);t=trade(b.account)
+ t.status.modified_price=105;t.status.cancel_quantity=2
+ b.api=NS(update_status=lambda a:None,list_trades=lambda:[t])
+ row=b.reconcile_orders()[0]
+ assert row['limit_price']==105 and row['cancelled_quantity']==2

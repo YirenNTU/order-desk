@@ -161,7 +161,7 @@ def test_cli_preserves_personal_shares_and_sends_only_strategy_delta(tmp_path,mo
     config={'mode':'production','lot_mode':'odd','strategies':[{'name':'alpha','signal_path':'strategies/alpha/signal.json','extra_twd':600}]}
     (tmp_path/'config.json').write_text(json.dumps(config))
     class Broker(FakeBroker):
-        def reconcile_orders(self):return [dict(manual('Buy',10), limit_price=100)]+super().reconcile_orders()
+        def reconcile_orders(self):return [dict(manual('Buy',10), limit_price=100, quantity=10)]+super().reconcile_orders()
     fake=Broker(positions={'2330':10},cash=10000,auto_fill=True);fake.set_quotes({'2330':_quote('2330')})
     monkeypatch.setattr(cli,'_broker',lambda mode:BrokerWorker(fake))
     assert cli.main(['--config',str(tmp_path/'config.json'),'--send','--confirm','APPROVE'])==0
