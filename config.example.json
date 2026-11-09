@@ -22,7 +22,7 @@
   ],
   "mode": "simulation",
   "lot_mode": "odd",
-  "cash_check": false,
+  "cash_check": true,
   "schedule": {
     "enabled": true,
     "git_pull": {
@@ -35,5 +35,7 @@
     }
   },
   "inventory_mismatch_policy": "reconcile_actual",
-  "restricted_order_policy": "freeze_reweight"
+  "restricted_order_policy": "freeze_reweight",
+  "cash_fee_rate": 0.001425,
+  "cash_min_fee_twd": 20
 }

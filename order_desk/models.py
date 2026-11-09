@@ -39,6 +39,8 @@ class ExecutionPolicy:
     max_turnover: float = 2.0
     allow_sell_proceeds_for_buys: bool = False
     cash_check: bool = False
+    cash_fee_rate: float = 0.001425
+    cash_min_fee_twd: float = 20.0
     order_ttl_seconds: int = 120
 
 

@@ -10,12 +10,13 @@ import sqlite3
 import hashlib
 import copy
 import subprocess
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from order_desk.audit import audit_with_history, record_audit, require_clear_audit
+from order_desk.cash import check_cash, money
 from order_desk.calendar import CalendarUnavailable, TwseCalendar
 from order_desk.books import (
     apply_book,
@@ -201,6 +202,7 @@ def _run_account_once(args, config, root):
                 worker, [], ledger, {}, cash_reserve_twd=policy.cash_reserve_twd,
                 wait_seconds=float(config.get("sell_wait_seconds", 30)),
                 poll_seconds=float(config.get("sell_poll_seconds", 2)), cash_check=policy.cash_check,
+                cash_fee_rate=policy.cash_fee_rate, cash_min_fee_twd=policy.cash_min_fee_twd,
                 persist=lambda: save_account_ledger(root, ledger, ledger_paths),
                 preflight=lambda: _preflight(worker, ledger, root))
             if restricted_policy == 'freeze_reweight' and defer_restricted_orders(ledger, cycle_id()):
@@ -272,6 +274,7 @@ def _run_account_once(args, config, root):
             wait_seconds=float(config.get("sell_wait_seconds", 30)),
             poll_seconds=float(config.get("sell_poll_seconds", 2)),
             cash_check=policy.cash_check,
+            cash_fee_rate=policy.cash_fee_rate, cash_min_fee_twd=policy.cash_min_fee_twd,
             persist=lambda: save_account_ledger(root, ledger, ledger_paths),
             preflight=lambda: _preflight(worker, ledger, root),
         )
@@ -346,17 +349,16 @@ def _plan_several(worker, config, root, policy, mode, ledger):
         positions = {}
         for item in worker.call('positions'):
             positions[item.ticker] = positions.get(item.ticker, 0) + item.shares
-    cash = float(worker.call("available_cash")) if policy.cash_check else 0.0
-    preview = plan_strategies(
-        entries,
-        ledger,
-        quotes,
-        positions,
-        cash,
-        policy,
-        mode=mode,
-    )
-    preview["broker_positions"] = {t: q for t, q in positions.items() if q}
+    # Cash shortage must not prevent the sell leg. Check buying funds separately
+    # for preview and again immediately before every new buy.
+    preview = plan_strategies(entries, ledger, quotes, positions, 0.0,
+                              replace(policy, cash_check=False), mode=mode)
+    preview['broker_positions'] = {t: q for t, q in positions.items() if q}
+    if policy.cash_check and any(o.action == 'Buy' for o in preview['plan'].orders):
+        preview['cash_safety'] = check_cash(worker, ledger, preview['plan'].orders,
+            reserve=policy.cash_reserve_twd, fee_rate=policy.cash_fee_rate,
+            minimum_fee=policy.cash_min_fee_twd)
+
     return preview
 
 
@@ -398,13 +400,15 @@ def _policy(config: dict, several: bool) -> ExecutionPolicy:
     return ExecutionPolicy(
         lot_mode=config.get("lot_mode", "odd"),
         limit_offset_bps=int(config.get("limit_offset_bps", 0)),
-        cash_reserve_twd=float(config.get("cash_reserve_twd", 0)),
+        cash_reserve_twd=money(config.get("cash_reserve_twd", 0), "cash reserve"),
         max_order_twd=float(config.get("max_order_twd", 50_000_000)),
         max_daily_twd=float(config.get("max_daily_twd", 50_000_000)),
         max_position_twd=float(config.get("max_position_twd", 50_000_000)),
         max_turnover=float(config.get("max_turnover", 2)),
         allow_sell_proceeds_for_buys=several,
-        cash_check=bool(config.get("cash_check", False)),
+        cash_check=config.get('mode') == 'production' or bool(config.get('cash_check', True)),
+        cash_fee_rate=money(config.get('cash_fee_rate', 0.001425), 'cash fee rate'),
+        cash_min_fee_twd=money(config.get('cash_min_fee_twd', 20), 'cash minimum fee'),
     )
 
 
@@ -420,6 +424,9 @@ def _broker(mode: str) -> BrokerWorker:
 
 
 def _print_preview(preview: dict) -> None:
+    cash = preview.get('cash_safety')
+    if cash:
+        print(f"cash safety: {cash['status']}; available={cash.get('available_twd', 'unverified')}, required={cash.get('required_twd', 'unverified')}")
     plan = preview["plan"]
     for note in preview["notes"]:
         print(note)
@@ -468,12 +475,16 @@ def _print_open_orders(ledger: dict, confirmed: bool) -> None:
 
 
 def _print_submit_status(status: str, ledger: dict) -> None:
+    if status == 'buys_waiting_for_cash':
+        report = ledger.get('cash_safety', {})
+        print(f"cash safety: {report.get('status', 'unavailable')}; available={report.get('available_twd', 'unverified')}, required={report.get('required_twd', 'unverified')}, shortfall={report.get('shortfall_twd', 'unverified')}")
+        print(report.get('reason', 'funds unavailable'))
     messages = {
         "completed": "sells finished before buys; all orders are done",
         "completed_with_deferrals": "tradable orders completed; restricted holdings retained and recorded for next rebalance",
         "reweight_required": "restricted orders deferred; next invocation reweights remaining capital before further orders",
         "sells_working": "sells are still working; buys were not sent",
-        "buys_waiting_for_cash": "sells finished, but available cash does not cover the buys",
+        "buys_waiting_for_cash": "cash safety details saved in ledger cash_safety; sells finished, but available cash does not cover the buys",
         "buys_working": "sells finished and buys were sent; some buys are still working",
     }
     print(messages.get(status, status))

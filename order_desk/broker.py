@@ -44,6 +44,7 @@ class BrokerAdapter(Protocol):
     def health(self) -> Mapping[str, Any]: ...
     def positions(self) -> list[BrokerPosition]: ...
     def available_cash(self) -> float: ...
+    def cash_snapshot(self) -> Mapping[str, Any]: ...
     def settlements(self) -> list[Mapping[str, Any]]: ...
     def quotes(self, tickers: list[str]) -> dict[str, Quote]: ...
     def place_order(self, intent: OrderIntent) -> BrokerOrderResult: ...
@@ -66,6 +67,7 @@ class FakeBroker:
         self._quotes = dict(quotes or {})
         self._positions = dict(positions or {})
         self._cash = float(cash)
+        self._bank_cash = float(cash)
         self.auto_fill = auto_fill
         self.fail_after_accept = fail_after_accept
         self.connected = False
@@ -89,6 +91,16 @@ class FakeBroker:
 
     def available_cash(self) -> float:
         return self._cash
+
+    def cash_snapshot(self):
+        rows = []
+        for row in self.reconcile_orders():
+            item = dict(row)
+            item.setdefault('quantity', item.get('broker_quantity'))
+            rows.append(item)
+        return {'mode': 'simulation', 'balance': {'acc_balance': self._bank_cash,
+                'date': datetime.now(timezone.utc).isoformat(), 'errmsg': ''},
+                'settlements': [], 'orders': rows}
 
     def settlements(self) -> list[Mapping[str, Any]]:
         return []
@@ -171,6 +183,10 @@ def _object_dict(value: Any) -> dict[str, Any]:
             return result
     if hasattr(value, "model_dump"):
         result = value.model_dump()
+        if isinstance(result, dict):
+            return result
+    if hasattr(value, 'dict'):
+        result = value.dict()
         if isinstance(result, dict):
             return result
     if hasattr(value, "__dict__"):
@@ -319,6 +335,19 @@ class ShioajiBroker:
         if error:
             raise BrokerError(f"account balance unavailable: {error}")
         return float(balance.acc_balance)
+
+    def cash_snapshot(self):
+        if self.api is None:
+            raise BrokerError('broker is not connected')
+        balance = self.api.account_balance(account=self.account)
+        settlements = self.api.settlements(account=self.account)
+        rows = [{'T': nonnegative_integer(row.T, 'settlement T'), 'date': str(row.date),
+                 'amount': float(row.amount)} for row in settlements]
+        orders = self.reconcile_orders()
+        return {'mode': self.mode, 'balance': {'acc_balance': balance.acc_balance,
+                'date': str(balance.date), 'errmsg': str(getattr(balance, 'errmsg', '')),
+                'fetch_status': _enum_value(getattr(balance, 'status', 'Fetched'))},
+                'settlements': rows, 'orders': orders}
 
     def settlements(self) -> list[Mapping[str, Any]]:
         if self.api is None:

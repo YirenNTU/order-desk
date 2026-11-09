@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from order_desk.broker import BrokerError, OrderNotSubmitted
 from order_desk.inventory import ReplanRequired
+from order_desk.cash import check_cash
 from order_desk.deferrals import cycle_id, frozen_tickers
 
 from order_desk.capital import (
@@ -145,6 +146,8 @@ def submit_sells_then_buys(
     wait_seconds: float,
     poll_seconds: float,
     cash_check: bool = False,
+    cash_fee_rate: float = 0.001425,
+    cash_min_fee_twd: float = 20.0,
     persist: Callable[[], None] | None = None,
     preflight: Callable[[], None] | None = None,
 ) -> str:
@@ -195,15 +198,13 @@ def submit_sells_then_buys(
         return "sells_working"
     if buys and preflight is not None:
         preflight()
-    buy_twd = sum(order.estimated_notional for order in buys)
-    if cash_check and buys:
-        try:
-            buying_power = max(0.0, float(worker.call("available_cash")) - cash_reserve_twd)
-        except BrokerError:
-            return "buys_waiting_for_cash"
-        if buy_twd > buying_power + 1e-6:
-            return "buys_waiting_for_cash"
-    for order in buys:
+    for index, order in enumerate(buys):
+        if cash_check:
+            report = check_cash(worker, ledger, buys[index:], reserve=cash_reserve_twd,
+                                fee_rate=cash_fee_rate, minimum_fee=cash_min_fee_twd)
+            remember()
+            if report['status'] != 'allowed':
+                return 'buys_waiting_for_cash'
         _submit_one(worker, ledger, order, allocations, pending, remember)
     if not _refresh_or_keep(worker, ledger):
         remember()
