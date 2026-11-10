@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from order_desk.control import begin_manual, config_signature, manual_hold, origin, release_manual, retire_for_manual
+from order_desk.control import blocking_orders, retention_scope, validate_retained_orders, begin_manual, config_signature, manual_hold, origin, release_manual, retire_for_manual
 from order_desk.audit import audit_with_history, record_audit, require_clear_audit
 from order_desk.cash import check_cash, money
 from order_desk.calendar import CalendarUnavailable, TwseCalendar
@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="place the planned orders; default is preview only",
     )
+    parser.add_argument("--keep-working-orders", action="store_true", help="with --new-manual-plan, retain verified non-overlapping orders of paused strategies")
     parser.add_argument("--new-manual-plan", action="store_true", help="hold scheduled sends, reconcile and retire old plan, then preview a new manual plan; requires --confirm APPROVE; never sends orders")
     parser.add_argument("--retry-terminal", action="store_true", help="explicitly retry confirmed failed/cancelled remainders of the saved plan")
     parser.add_argument("--reconcile-only", action="store_true", help="record broker results without placing any orders")
@@ -80,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weekly-order", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--weekly-tick", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.keep_working_orders and not args.new_manual_plan:
+        parser.error('--keep-working-orders requires --new-manual-plan')
     if args.new_manual_plan and (args.send or args.retry_terminal or args.reconcile_only or args.audit
             or args.weekly_order or args.weekly_tick or args.weekly_pull or args.resume_schedule
             or args.install_schedule or args.uninstall_schedule):
@@ -116,6 +119,10 @@ def main(argv: list[str] | None = None) -> int:
                 saved, _ = load_account_ledger(root)
                 if manual_hold(saved):
                     print('manual session owns this account; scheduled sends are held')
+                    if any(o.get('retained_for_manual') for o in saved.get('open_orders', [])):
+                        args.send = False
+                        args.reconcile_only = True
+                        return _run_account(args, config, root)
                     return 0
                 if cycle_already_completed(saved, cycle_id()):
                     print('this cycle is already completed in the account ledger; no new orders')
@@ -190,7 +197,8 @@ def _run_account_once(args, config, root):
             report = audit_with_history(worker, ledger, root)
             record_audit(root, report)
             require_clear_audit(report)
-            retire_for_manual(ledger)
+            scope = retention_scope(load_strategy_entries(config, root), ledger) if args.keep_working_orders else None
+            retire_for_manual(ledger, scope=scope)
             ledger['manual_session']['state'] = 'waiting_for_reconciliation'
             save_account_ledger(root, ledger, ledger_paths)
         if args.audit:
@@ -231,7 +239,7 @@ def _run_account_once(args, config, root):
                 if defer_restricted_orders(ledger, cycle_id()):
                     save_account_ledger(root, ledger, ledger_paths)
                     print('restricted orders recorded for next rebalance; recalculating tradable capital')
-            if ledger["open_orders"] or not confirmed:
+            if not confirmed or blocking_orders(ledger):
                 _print_open_orders(ledger, confirmed)
                 worker.close()
                 return 0
@@ -292,6 +300,9 @@ def _run_account_once(args, config, root):
             print('error: manual signal changed; prepare and review the manual plan again', file=sys.stderr)
             worker.close()
             return 1
+    for order in ledger.get('open_orders', []):
+        if order.get('retained_for_manual'):
+            print(f"retained existing order: {order['ticker']} {order['action']} remaining={order['shares']-order.get('applied_shares',0)}; original strategy and cash reservation retained")
     _print_preview(preview)
     if not args.send:
         print("preview only; nothing was sent")
@@ -360,8 +371,15 @@ def _run_account_once(args, config, root):
 
 
 def _checked_audit(worker, ledger, root, *, tickers=(), replan_on_change=True, expected_quarantine=None):
+    retained_tickers = {o['ticker'] for o in ledger.get('open_orders', []) if o.get('retained_for_manual')}
+    if retained_tickers:
+        if not refresh_open_orders(worker, ledger):
+            raise SignalError('retained order outcome unavailable; no new orders')
+        validate_retained_orders(ledger)
     report = audit_with_history(worker, ledger, root, tickers=tickers)
     record_audit(root, report)
+    if retained_tickers & set(report.get('inventory_issues', {})):
+        raise ReplanRequired('retained order inventory changed during audit; reconcile again without adjusting it as an external fill')
     isolated = set()
     changed = False
     if ledger.get('inventory_mismatch_policy') in {'quarantine', 'reconcile_actual'}:
@@ -391,6 +409,7 @@ def _plan_several(worker, config, root, policy, mode, ledger):
     if mode == "dry_run":
         raise SignalError("dry_run has no market prices; set mode to simulation")
     entries = load_strategy_entries(config, root)
+    validate_retained_orders(ledger, scope=retention_scope(entries, ledger))
     tickers = sorted(
         {
             str(item["ticker"])

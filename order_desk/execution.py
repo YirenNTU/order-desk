@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from order_desk.broker import BrokerError, OrderNotSubmitted
+from order_desk.control import blocking_orders, validate_retained_orders
 from order_desk.inventory import ReplanRequired
 from order_desk.cash import check_cash
 from order_desk.deferrals import cycle_id, frozen_tickers
@@ -131,7 +132,7 @@ def _refresh_orders(worker, ledger, *, today=None):
         if status not in TERMINAL_ORDER_STATUSES:
             still_open.append(order)
             continue
-        if int(order.get("applied_shares", 0)) >= int(order["shares"]):
+        if order.get("retained_for_manual") or int(order.get("applied_shares", 0)) >= int(order["shares"]):
             ledger.setdefault("order_history", []).append(copy.deepcopy(order))
             continue
         if _placed_before_today(order, current_day):
@@ -148,7 +149,7 @@ def prepare_next_day_execution(ledger, *, today=None):
     pending = ledger.get('execution')
     if not pending or pending.get('trading_day', today) >= today:
         return False
-    if ledger.get('open_orders'):
+    if blocking_orders(ledger):
         raise SignalError('prior-day orders still need confirmed final results')
     if not pending.get('budgets') or not pending.get('targets') or not pending.get('signal_signature'):
         raise SignalError('prior-day original budgets and targets missing; recover the saved plan first')
@@ -198,7 +199,7 @@ def submit_sells_then_buys(
     preflight: Callable[[], None] | None = None,
 ) -> str:
     """Place sells first. Buys go out only after every sell is filled and cash covers them."""
-    if ledger["open_orders"]:
+    if blocking_orders(ledger):
         raise SignalError("open orders are still working; no new orders were sent")
     pending = ledger.get("execution")
     if pending:
@@ -232,7 +233,7 @@ def submit_sells_then_buys(
         return "sells_working"
     remember()
     deadline = time.monotonic() + max(0.0, wait_seconds)
-    while any(order["action"] == "Sell" for order in ledger["open_orders"]):
+    while any(order["action"] == "Sell" for order in blocking_orders(ledger)):
         if time.monotonic() >= deadline:
             break
         time.sleep(max(0.0, poll_seconds))
@@ -240,7 +241,7 @@ def submit_sells_then_buys(
             remember()
             return "sells_working"
         remember()
-    if any(order["action"] == "Sell" for order in ledger["open_orders"]):
+    if any(order["action"] == "Sell" for order in blocking_orders(ledger)):
         return "sells_working"
     if buys and preflight is not None:
         preflight()
@@ -256,7 +257,7 @@ def submit_sells_then_buys(
         remember()
         return "buys_working"
     remember()
-    if ledger["open_orders"]:
+    if blocking_orders(ledger):
         return "buys_working"
     completed = ledger.pop("execution", None)
     if completed:
@@ -270,6 +271,8 @@ def submit_sells_then_buys(
 
 
 def _submit_one(worker, ledger, order, allocations, pending, remember):
+    validate_retained_orders(ledger, candidate_tickers=[order.ticker],
+                             candidate_strategies=[a['strategy'] for a in allocations.get(order.client_order_id, [])])
     pending = ledger["execution"]  # reconciliation replaces the staged ledger atomically
     used = {o.get("custom_field") for o in ledger.get("order_history", []) + ledger["open_orders"]}
     token = uuid.uuid4().hex
