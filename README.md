@@ -33,18 +33,85 @@ TRADING_ALLOW_PRODUCTION=YES_I_ACCEPT_REAL_ORDERS
 - `name` 必須等於 `signal.json` 的 `strategy_id`
 - `extra_twd`：這次要加進這個策略的現金。第一次買填這裡。它會留到你改回 `0`；沒改回的話，下次計畫會再加一次
 - `cash_out_twd`：要提出的金額。大於 0 會賣掉這個策略多出來的股票
-- `adjust_positions`：缺欄位或 `true` 會照新權重調倉。設成 `false` 時當週不調這個策略：不跟新權重、不加錢、也不提領，帳上股數原樣留著。策略仍要留在 `config.json`。這個開關會一直維持，直到你改回 `true`
+- `adjust_positions`：每個策略分別設定，缺欄位或 `true` 會參與新計畫。`false` 在建立新計畫時保留該策略持股，不跟新權重調倉、不加錢、也不提領。策略仍要留在 `config.json`；開關持續生效，直到改回 `true`。不會取消已掛單或中止已保存的舊計畫，詳見下方。
 - `mode`：`simulation` 模擬，`production` 正式
 - `lot_mode`：`odd` 零股，`common` 整張
 - `cash_check`：正式模式強制啟用資金安全檢查；即使舊設定為 `false` 也不能略過。模擬模式可明確關閉。詳見下方「資金安全檢查」。
-- `schedule.enabled`：`false` 時已安裝的排程下一分鐘起不再拉權重、也不下單。缺欄位視為開啟
+- `schedule.enabled`：`false` 時已安裝的排程在下一次檢查起不再啟動拉權重或下單工作；不會中斷正在執行的程序或撤銷已掛單。缺欄位視為開啟
 - `schedule.git_pull` / `schedule.order`：台北時間。從每週第一個開盤日到週五，到了時間就拉權重或補下單；週一休市就順延
+- `restricted_order_policy`：預設 `freeze_reweight`，券商已確認預收／圈存限制導致失敗時，記錄待處理股數，保留受限持股、扣除其占用資金後重新配置。`stop` 保持停止處理。不是忽略所有注意股或所有下單失敗。
+- `inventory_mismatch_policy`：預設 `reconcile_actual`，依核對後的實際策略持股調整帳本並重算配置；`quarantine` 隔離有差異的股票；`stop` 遇到差異即停止。這些模式都不會把結果不明的委託當成未成交。
+- `cash_fee_rate` / `cash_min_fee_twd`：買單預留手續費的比例與每筆最低金額，預設分別為 `0.001425`、`20`。保留較高者；不是券商實際收費保證。
 
 帳本裡已經有股數的策略都要留在 `config.json`。拿掉之後，整份計畫會拒絕執行。
 
 股數 =（這個策略帳上股票的現值 + `extra_twd` − `cash_out_twd`）× 權重 ÷ 現價。帳本不存總金額，現值是下單當下用股價現算的。
 
 每週權重在 `strategies/<名稱>/signal.json`，有效時間要蓋住當週交易日。`adjust_positions` 為 `false` 的策略即使 signal 過期，也不會擋住其他策略。
+
+### 只調整部分策略
+
+例如想保留 `super_alpha_4`、`super_alpha_5` 的持股，只讓 `rolling_top_10` 參與新調倉，可以使用以下完整設定。範例採 `simulation`；正式使用時才改為 `production`，並填好自己的 `.env` 與正式下單授權。
+
+```json
+{
+  "strategies": [
+    {
+      "name": "super_alpha_4",
+      "signal_path": "strategies/super_alpha_4/signal.json",
+      "extra_twd": 0,
+      "cash_out_twd": 0,
+      "adjust_positions": false
+    },
+    {
+      "name": "super_alpha_5",
+      "signal_path": "strategies/super_alpha_5/signal.json",
+      "extra_twd": 0,
+      "cash_out_twd": 0,
+      "adjust_positions": false
+    },
+    {
+      "name": "rolling_top_10",
+      "signal_path": "strategies/rolling_top_10/signal.json",
+      "extra_twd": 0,
+      "cash_out_twd": 0,
+      "adjust_positions": true
+    }
+  ],
+  "mode": "simulation",
+  "lot_mode": "odd",
+  "cash_check": true,
+  "schedule": {
+    "git_pull": {"weekday": "monday", "time": "08:00"},
+    "order": {"weekday": "monday", "time": "09:20"},
+    "enabled": true
+  },
+  "restricted_order_policy": "freeze_reweight",
+  "inventory_mismatch_policy": "reconcile_actual",
+  "cash_fee_rate": 0.001425,
+  "cash_min_fee_twd": 20
+}
+```
+
+請使用 JSON 布林值 `false` / `true`，不要寫成字串 `"false"` / `"true"`。暫停不是清倉，也不會把這個策略的資金移給其他策略。若策略尚無持股且 `extra_twd` 為 0，即使開啟也不會憑空產生投入資金。恢復前檢查 `extra_twd`、`cash_out_twd`：暫停期間雖然不套用這兩個值，恢復後的新計畫仍會讀取它們。
+
+### 設定何時生效
+
+| 情況 | 實際行為 |
+| --- | --- |
+| 尚未建立計畫 | 新計畫依各策略的 `adjust_positions` 決定是否調倉。 |
+| 已有券商掛單 | 改成 `false` 不會撤單；既有委託仍可能成交，程式仍需核對並記帳。 |
+| 當天已有未完成計畫 | 續跑可能沿用已保存的訂單，不會只因改成 `false` 就停止該策略。 |
+| 跨日或受限股需要重算 | 先釐清舊委託，再檢查已保存預算與訊號。同一調倉週期中改動 `adjust_positions` 會改變訊號摘要，重算時可能因與原計畫不符而停止。 |
+| 要暫停整個自動排程 | 設 `schedule.enabled` 為 `false`，後續排程檢查會停止啟動工作；不會中斷已開始的程序或撤銷券商掛單，也不阻止手動執行下單指令。 |
+
+因此，`adjust_positions: false` 適合在新一輪計畫開始前設定，不是當天未完成單的立即停止開關。不要刪除策略、帳本或未完成紀錄來強迫重算。帳務核對仍會運作；若實際庫存有差異，`reconcile_actual` 仍可能調整記帳股數並留下原因。
+
+### 更新後保留每位使用者的設定
+
+`git pull` 更新程式、文件、範本及策略權重，不會把 `config.example.json` 自動覆蓋到既有的 `config.json`。已有使用者只需在自己的設定中加入需要的欄位；不要重新複製範本覆蓋個人設定。`adjust_positions` 沒填預設為 `true`，其餘新增政策的預設值如上。
+
+歷史帳務跨日核對不需要另加開關，更新程式後會由既有核對流程使用。每位使用者使用自己的券商帳戶、帳本和歷史證據，不能沿用其他人的成交或已扣款確認。已安裝的排程每次啟動新程序讀取目前版本；正在執行的舊程序不會中途換版。
 
 ## 下單
 
