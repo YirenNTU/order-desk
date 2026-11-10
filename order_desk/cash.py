@@ -40,6 +40,46 @@ def _stamp(raw):
         raise SignalError('cash balance timestamp unavailable') from exc
 
 
+def confirm_settlement_posting(ledger, settlement_date, amount_twd, *, confirmed_at=None):
+    """Record an explicit account-owner confirmation; this never infers a debit."""
+    binding = ledger.get('account_binding')
+    if not isinstance(binding, dict) or not binding.get('account') or binding.get('mode') != 'production':
+        raise SignalError('posting confirmation requires a bound production account')
+    at = confirmed_at or datetime.now(TAIPEI)
+    day = datetime.fromisoformat(settlement_date).date().isoformat()
+    if day != settlement_date or day != at.astimezone(TAIPEI).date().isoformat():
+        raise SignalError('posting confirmation must be for the current settlement date')
+    amount = money(amount_twd, 'confirmed bank debit')
+    if amount <= 0:
+        raise SignalError('confirmed bank debit must be positive')
+    confirmations = ledger.setdefault('settlement_posting_confirmations', [])
+    for row in confirmations:
+        if (row.get('account_binding') == binding and row.get('settlement_date') == day
+                and row.get('amount_twd') == amount
+                and row.get('source') == 'account_owner_confirmed_bank_debit'):
+            return row
+    row = {'account_binding': dict(binding), 'settlement_date': day, 'amount_twd': amount,
+           'confirmed_at': at.isoformat(), 'source': 'account_owner_confirmed_bank_debit'}
+    confirmations.append(row)
+    return row
+
+
+def _posted_t0_debit(ledger, today, amount, bank_stamp):
+    binding = ledger.get('account_binding')
+    if amount <= 0 or not isinstance(binding, dict) or not binding.get('account') or binding.get('mode') != 'production':
+        return None
+    for row in ledger.get('settlement_posting_confirmations', []):
+        if (row.get('account_binding') != binding or row.get('settlement_date') != today
+                or row.get('source') != 'account_owner_confirmed_bank_debit'):
+            continue
+        if money(row.get('amount_twd'), 'confirmed bank debit') != amount:
+            continue
+        at = _stamp(row.get('confirmed_at'))
+        if at.date().isoformat() == today and bank_stamp >= at:
+            return row
+    return None
+
+
 def assess_cash(snapshot, ledger, orders, *, reserve=0.0, fee_rate=0.001425, minimum_fee=20.0, now=None):
     now = now or datetime.now(TAIPEI)
     today = now.astimezone(TAIPEI).date().isoformat()
@@ -167,8 +207,11 @@ def assess_cash(snapshot, ledger, orders, *, reserve=0.0, fee_rate=0.001425, min
                             'confirmed_proceeds_floor_twd': proceeds})
     # Project payment capacity by settlement date, rather than treating sale
     # receivables as bank deposits. T0 postings are ambiguous: reserve any debit
-    # unless the broker no longer reports it; never credit T0 receipts twice.
-    t0_hold = max(0.0, -settlements.get(0, 0))
+    # unless the owner confirms this exact debit was posted and the bank balance
+    # was fetched after that confirmation. Never credit T0 receipts twice.
+    t0_reported_payable = max(0.0, -settlements.get(0, 0))
+    posted = _posted_t0_debit(ledger, today, t0_reported_payable, stamp)
+    t0_hold = 0.0 if posted else t0_reported_payable
     t1_net = settlements.get(1, 0)
     broker_net = settlements.get(2, 0)
     estimated_net = filled_sales - filled_buys
@@ -213,7 +256,10 @@ def assess_cash(snapshot, ledger, orders, *, reserve=0.0, fee_rate=0.001425, min
             'filled_net_payable_hold_twd': filled_hold,
             'unfilled_buy_hold_twd': pending_buys,
             'order_commitments': details,
-            'today_settlement_status_unverified': settlements.get(0, 0) < 0,
+            'today_settlement_status_unverified': t0_hold > 0,
+            'today_reported_payable_twd': t0_reported_payable,
+            'today_posted_debit_excluded_twd': t0_reported_payable if posted else 0.0,
+            'today_posting_confirmation': dict(posted) if posted else None,
             'reason': 'settlement-date buying power includes confirmed receipts once; earlier payments must remain covered; unfilled sells never credited'}
 
 

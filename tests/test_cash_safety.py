@@ -341,3 +341,54 @@ def test_unfilled_buy_against_receipt_reserved_before_new_buy():
  data['orders']=[dict(cash_order('sale','Filled',10),action='Sell'),cash_order('pending')]
  r=assess_cash(data,ledger(),[buy()],now=NOW)
  assert r['available_twd']==357 and r['status']=='insufficient'
+
+
+def posted_ledger(amount=200):
+ from order_desk.cash import confirm_settlement_posting
+ l=ledger();l['account_binding']={'mode':'production','account':'test-account-hash'}
+ confirm_settlement_posting(l,'2026-11-09',amount,confirmed_at=NOW-timedelta(seconds=10))
+ return l
+
+
+def test_confirmed_posted_debit_is_not_subtracted_again_or_added_as_cash():
+ data=snapshot(800);data['settlements'][0]['amount']=-200
+ r=assess_cash(data,posted_ledger(),[buy()],now=NOW)
+ assert r['bank_balance_twd']==800 and r['available_twd']==800
+ assert r['today_posted_debit_excluded_twd']==200
+ assert not r['today_settlement_status_unverified']
+
+
+@pytest.mark.parametrize('change',['date','account','amount','source','balance_before_confirmation','next_day'])
+def test_posting_confirmation_cannot_be_reused_outside_its_exact_scope(change):
+ data=snapshot(800);data['settlements'][0]['amount']=-200;l=posted_ledger()
+ row=l['settlement_posting_confirmations'][0]
+ if change=='date':row['settlement_date']='2026-11-06'
+ elif change=='account':row['account_binding']['account']='other'
+ elif change=='amount':row['amount_twd']=201
+ elif change=='source':row['source']='guessed'
+ elif change=='balance_before_confirmation':data['balance']['date']=(NOW-timedelta(seconds=20)).isoformat()
+ elif change=='next_day':row['confirmed_at']=(NOW-timedelta(days=1)).isoformat()
+ r=assess_cash(data,l,[buy()],now=NOW)
+ assert r['available_twd']==600 and r['today_posted_debit_excluded_twd']==0
+ assert r['today_settlement_status_unverified']
+
+
+def test_confirmation_is_idempotent_and_does_not_change_orders():
+ from order_desk.cash import confirm_settlement_posting
+ l=posted_ledger();l['open_orders']=[{'status':'Unconfirmed','ticker':'2330'}]
+ before=copy.deepcopy(l)
+ confirm_settlement_posting(l,'2026-11-09',200,confirmed_at=NOW)
+ assert l==before
+
+
+def test_confirmation_cannot_clear_other_settlement_periods():
+ data=snapshot(800);data['settlements'][0]['amount']=-200;data['settlements'][1]['amount']=-200
+ assert assess_cash(data,posted_ledger(),[],now=NOW)['available_twd']==600
+
+
+def test_confirmation_requires_bound_account_and_current_date():
+ from order_desk.cash import confirm_settlement_posting
+ with pytest.raises(SignalError):confirm_settlement_posting(ledger(),'2026-11-09',200,confirmed_at=NOW)
+ l=posted_ledger()
+ with pytest.raises(SignalError):confirm_settlement_posting(l,'2026-11-06',200,confirmed_at=NOW)
+ with pytest.raises(SignalError):confirm_settlement_posting(l,'2026-11-09',-200,confirmed_at=NOW)
