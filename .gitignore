@@ -8,3 +8,11 @@ logs/
 
 .DS_Store
 shioaji.log
+
+# Private environment variants and broker certificate/key files
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
