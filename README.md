@@ -6,6 +6,42 @@
 
 `git pull` 會更新程式和 `strategies/<名稱>/signal.json`。它不會改 `.env`、`config.json`、`strategies/<名稱>/ledger.json`、`logs/`。
 
+## 更新與操作入口速查
+
+既有使用者先切到自己的 Order Desk 專案目錄，也就是有 `config.json`、`.venv/` 的目錄，再更新：
+
+```bash
+git pull --ff-only
+```
+
+以下指令都在同一個目錄執行。不要重新複製範本覆蓋自己的設定。已啟用的排程會在後續啟動時使用新版；若要先調整手動操作設定，可先將 `schedule.enabled` 設為 `false`，並等待正在執行的程序結束。
+
+| 目的 | 指令（接在 `.venv/bin/python -m order_desk` 後） | 是否送新單 |
+| --- | --- | --- |
+| 查看目前設定的預覽 | 不加參數 | 否；可能核對並更新本機帳本 |
+| 核對現有委託與成交 | `--reconcile-only` | 否 |
+| 結束已確認的舊計畫、準備新手動預覽 | `--new-manual-plan --confirm APPROVE` | 否；尚未結束的舊單會阻擋 |
+| 保留不參與調倉、股票不重疊的其他策略掛單 | `--new-manual-plan --keep-working-orders --confirm APPROVE` | 否 |
+| 同一策略仍有掛單，固定該股票並調整其餘股票 | `--new-manual-plan --freeze-working-stocks --confirm APPROVE` | 否；先保留占用的資金與持股 |
+| 執行或續跑手動計畫 | `--send --confirm APPROVE` | **會**；完成後重跑不另開一輪 |
+| 手動計畫完成後交回排程 | `--resume-schedule --confirm APPROVE` | **可能會**；立即檢查排程條件 |
+
+### 提領並保留同策略股票的操作順序
+
+先在 `config.json` 將要提領的策略設為 `adjust_positions: true`，`cash_out_twd` 填本次金額，`extra_twd` 填本次新增投入；其他不想調整的策略保持 `adjust_positions: false`。投入用 `extra_twd`，提領用 `cash_out_twd`，只重新配重則兩者都填 `0`。
+
+```bash
+.venv/bin/python -m order_desk --new-manual-plan --freeze-working-stocks --confirm APPROVE
+```
+
+確認預覽中的策略、提領金額、固定股票及其他股票差額都符合本次意圖後，才執行：
+
+```bash
+.venv/bin/python -m order_desk --send --confirm APPROVE
+```
+
+預覽不會送單；正式執行會重新核對與計算，行情改變時差額也可能改變。`cash_out_twd` 是降低策略配置的目標，並非銀行轉帳，也不保證成交後的淨賣款恰好等於該金額。實際款項依成交、費用與交割結果確認。不要為了重跑指令而刪除帳本、鎖檔或未完成紀錄。
+
 ## 安裝
 
 ```bash
@@ -46,7 +82,7 @@ TRADING_ALLOW_PRODUCTION=YES_I_ACCEPT_REAL_ORDERS
 
 帳本裡已經有股數的策略都要留在 `config.json`。拿掉之後，整份計畫會拒絕執行。
 
-股數 =（這個策略帳上股票的現值 + `extra_twd` − `cash_out_twd`）× 權重 ÷ 現價。帳本不存總金額，現值是下單當下用股價現算的。
+一般新計畫的股數 =（這個策略帳上股票的現值 + `extra_twd` − `cash_out_twd`）× 權重 ÷ 現價，並向下取整。接續或接管未完成計畫時會沿用帳本保存的原預算，避免漏掉已賣出、尚未買回的資金；有固定股票或保留掛單時，先扣除其占用額度，再配置其他股票，詳見下方流程。
 
 每週權重在 `strategies/<名稱>/signal.json`，有效時間要蓋住當週交易日。`adjust_positions` 為 `false` 的策略即使 signal 過期，也不會擋住其他策略。
 
@@ -210,6 +246,21 @@ python -m order_desk --send --confirm APPROVE
 策略配置預算與帳戶資金安全檢查是兩道不同限制：保留款會降低其他股票的配置額度，帳戶檢查也仍辨識這筆付款義務，但不會在同一份帳戶現金計算內重複扣款。沒有未完成計畫可沿用預算時，已保留的買單資金會與現有持股分開計入再扣留，避免下一輪把同筆未成交資金再扣一次。預覽會列出兩種額度。
 
 預覽成功且金額符合本次意圖後，由使用者執行一般的 `--send --confirm APPROVE`。若自行提高保留買單的限價，須重新準備預覽確認保留款。無法辨識的委託、成交量倒退或尚未釐清的跨日舊單仍會停止新增單。
+
+## 常見訊息與處理方式
+
+| 訊息 | 意義與處理方式 |
+| --- | --- |
+| `.venv/bin/python: no such file or directory` | 確認目前是包含 `.venv/` 的 Order Desk 專案目錄；初次安裝須先建立虛擬環境。 |
+| `another Order Desk process is using this account` | 另一個程序持有帳戶鎖。等它完成，不要刪鎖檔或同時反覆啟動送單。 |
+| `saved plan belongs to schedule/legacy` | 手動指令不能直接接手排程舊計畫；先選擇上方合適的 `--new-manual-plan` 預覽流程。 |
+| `retained stock overlaps an active strategy` | `--keep-working-orders` 只處理不重疊的其他策略掛單。同策略要先調整其他股票時，改用 `--freeze-working-stocks` 重新預覽。 |
+| `withdrawal exceeds retained capital plus new funds` | 提領金額超過該策略原預算加新增投入。確認金額放在正確策略，且沒有把投入誤填成提領；重跑指令不會修改設定。 |
+| `retained buy reservation … exceeds post-withdrawal budget` / `frozen holdings exceed cycle budget` | 提領後的預算不足以保留原掛單或固定持股。確認提領目標與保留內容，不能忽略其資金義務。 |
+| `planned turnover exceeds max_turnover` | 查看訊息列出的買賣總額、基準、比例與上限。新版採調整前持股現值與目標預算較大者，避免大額提領因分母縮小而誤擋；自訂較低上限仍會生效，不應直接關掉限制。 |
+| `(no orders)` / `preview only; nothing was sent` | 本次預覽沒有交易差額／尚未送單；不代表提領已完成或排程已恢復。 |
+
+交易量比例計算為「限價估算的買款＋賣款」除以「參與調倉持股現值與目標配置預算的較大者」。帳外及暫停策略持股不會放大這個基準。單筆金額、計畫總金額、部位上限和正式模式的資金檢查仍獨立執行；全數出清也不會略過交易量限制。
 
 ## 帳本
 
