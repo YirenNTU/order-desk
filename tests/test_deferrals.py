@@ -177,7 +177,8 @@ def test_cli_preview_records_deferral_then_send_uses_new_allocation(tmp_path,mon
     assert staged['strategies']==ledger['strategies']
     assert staged['execution']['reweight_required']
     assert not fake.orders
-    assert cli.main(args+['--send','--confirm','APPROVE'])==0
+    monkeypatch.setattr(cli, '_refuse_weekly_order', lambda *a: 0)
+    assert cli.main(args+['--weekly-order'])==0
     final,_=load_account_ledger(tmp_path)
     assert final['strategies']['a']=={'6213':7,'2330':4,'2317':8}
     assert not any(o['ticker']=='6213' for o in fake.orders.values())

@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from order_desk.control import begin_manual, config_signature, manual_hold, origin, release_manual, retire_for_manual
 from order_desk.audit import audit_with_history, record_audit, require_clear_audit
 from order_desk.cash import check_cash, money
 from order_desk.calendar import CalendarUnavailable, TwseCalendar
@@ -59,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="place the planned orders; default is preview only",
     )
+    parser.add_argument("--new-manual-plan", action="store_true", help="hold scheduled sends, reconcile and retire old plan, then preview a new manual plan; requires --confirm APPROVE; never sends orders")
     parser.add_argument("--retry-terminal", action="store_true", help="explicitly retry confirmed failed/cancelled remainders of the saved plan")
     parser.add_argument("--reconcile-only", action="store_true", help="record broker results without placing any orders")
     parser.add_argument("--resume-schedule", action="store_true", help="enable this account schedule and check remaining orders now; requires --confirm APPROVE")
@@ -78,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weekly-order", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--weekly-tick", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.new_manual_plan and (args.send or args.retry_terminal or args.reconcile_only or args.audit
+            or args.weekly_order or args.weekly_tick or args.weekly_pull or args.resume_schedule
+            or args.install_schedule or args.uninstall_schedule):
+        parser.error('--new-manual-plan cannot be combined with other actions')
+    if args.new_manual_plan and args.confirm != 'APPROVE':
+        print('error: --new-manual-plan requires --confirm APPROVE', file=sys.stderr)
+        return 1
     config_path = Path(args.config).expanduser().resolve()
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -105,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         with account_lock(root):
             if args.weekly_order:
                 saved, _ = load_account_ledger(root)
+                if manual_hold(saved):
+                    print('manual session owns this account; scheduled sends are held')
+                    return 0
                 if cycle_already_completed(saved, cycle_id()):
                     print('this cycle is already completed in the account ledger; no new orders')
                     return 0
@@ -146,8 +158,41 @@ def _run_account_once(args, config, root):
     ledger['inventory_mismatch_policy'] = inventory_policy
     worker = None
     try:
+        if args.new_manual_plan:
+            if not several:
+                raise SignalError('manual plan requires per-strategy ledgers')
+            begin_manual(ledger, new_request=True)['state'] = 'waiting_for_reconciliation'
+            save_account_ledger(root, ledger, ledger_paths)
+        elif args.send and not args.weekly_order:
+            if ledger.get('execution') and origin(ledger) != 'manual':
+                raise SignalError('saved plan belongs to schedule/legacy; use --new-manual-plan --confirm APPROVE to reconcile and take over without sending')
+            session = ledger.get('manual_session')
+            if ledger.get('execution') and (not session or ledger['execution'].get('manual_session_id') != session.get('id')):
+                raise SignalError('manual session identity missing or changed; use --new-manual-plan to reconcile before sending')
+            if session and session.get('state') == 'completed' and not ledger.get('execution'):
+                print('manual session already completed; use --new-manual-plan to request another rebalance')
+                return 0
+            if session and session.get('state') == 'waiting_for_reconciliation':
+                raise SignalError('manual handoff incomplete; rerun --new-manual-plan --confirm APPROVE')
+            if session and session.get('config_signature') != config_signature(config):
+                raise SignalError('manual settings changed; use --new-manual-plan to reconcile and review new settings')
+            session = begin_manual(ledger)
+            session.update(state='ready', config_signature=config_signature(config))
+            save_account_ledger(root, ledger, ledger_paths)
         policy = _policy(config, several)
         worker = _broker(mode)
+        if args.new_manual_plan:
+            confirmed = refresh_open_orders(worker, ledger)
+            save_account_ledger(root, ledger, ledger_paths)
+            if not confirmed:
+                raise SignalError('old order outcome unconfirmed; manual hold remains, no new orders')
+            # The audit happens before retiring any old plan and uses actual fills.
+            report = audit_with_history(worker, ledger, root)
+            record_audit(root, report)
+            require_clear_audit(report)
+            retire_for_manual(ledger)
+            ledger['manual_session']['state'] = 'waiting_for_reconciliation'
+            save_account_ledger(root, ledger, ledger_paths)
         if args.audit:
             report = audit_with_history(worker, ledger, root)
             record_audit(root, report)
@@ -236,6 +281,17 @@ def _run_account_once(args, config, root):
             worker.close()
         return 1
 
+    if args.new_manual_plan:
+        ledger['manual_session'].update(state='ready', config_signature=config_signature(config),
+                                        signal_signature=preview.get('signal_signature'))
+        save_account_ledger(root, ledger, ledger_paths)
+        print('manual plan prepared; scheduled sends remain held; no orders sent')
+    elif args.send and not args.weekly_order:
+        expected = ledger['manual_session'].get('signal_signature')
+        if expected and expected != preview.get('signal_signature'):
+            print('error: manual signal changed; prepare and review the manual plan again', file=sys.stderr)
+            worker.close()
+            return 1
     _print_preview(preview)
     if not args.send:
         print("preview only; nothing was sent")
@@ -263,6 +319,8 @@ def _run_account_once(args, config, root):
             ledger.setdefault('execution_history', []).append(copy.deepcopy(ledger['execution']))
         record_retry_checks(ledger, preview)
         ledger["execution"] = {
+            'origin':'schedule' if args.weekly_order else 'manual',
+            'manual_session_id':None if args.weekly_order else ledger['manual_session']['id'],
             "trading_day": taipei_now().date().isoformat(),
             "cycle_id": preview['cycle_id'], 'budgets': preview['budgets'],
             'targets': preview['targets'], 'signal_signature': preview['signal_signature'],
@@ -506,6 +564,10 @@ def _resume_schedule(config_path: Path, config: dict, confirm: str) -> int:
         return 1
     try:
         with account_lock(config_path.parent):
+            ledger, paths = load_account_ledger(config_path.parent)
+            if manual_hold(ledger):
+                release_manual(ledger)
+                save_account_ledger(config_path.parent, ledger, paths)
             # Install while paused; a failed install must not enable an existing job.
             paused = copy.deepcopy(config)
             paused.setdefault('schedule', {})['enabled'] = False
@@ -633,7 +695,7 @@ def _weekly_order_status(root: Path, code: int) -> str:
         ledger, _ = load_account_ledger(root)
     except SignalError:
         return "failed"
-    if ledger.get("open_orders") or ledger.get("execution"):
+    if manual_hold(ledger) or ledger.get("open_orders") or ledger.get("execution"):
         return "working"
     if code != 0:
         return "failed"

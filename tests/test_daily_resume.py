@@ -36,6 +36,8 @@ def test_new_day_reprices_pending_targets_without_reapplying_deposit(tmp_path, m
     from order_desk.books import load_strategy_entries, signal_signature
     from order_desk.deferrals import cycle_id
     cli, fake, args = fixture(tmp_path, monkeypatch, initial_short=False)
+    monkeypatch.setattr(cli, '_refuse_weekly_order', lambda *a: 0)
+    args = ['--config', str(tmp_path/'config.json'), '--weekly-order']
     config = json.loads((tmp_path/'config.json').read_text())
     config.pop('inventory_mismatch_policy')  # Existing users get new defaults after pull.
     config['strategies'][0]['extra_twd'] = 9999  # Already included in saved capital, must not be added twice.
@@ -150,6 +152,8 @@ def test_partial_prior_day_buy_retries_only_remaining_target_once(tmp_path,monke
     from order_desk.books import load_strategy_entries,signal_signature
     from order_desk.deferrals import cycle_id
     cli,fake,args=fixture(tmp_path,monkeypatch,initial_short=False)
+    monkeypatch.setattr(cli, '_refuse_weekly_order', lambda *a: 0)
+    args = ['--config', str(tmp_path/'config.json'), '--weekly-order']
     config=json.loads((tmp_path/'config.json').read_text());config['inventory_mismatch_policy']='reconcile_actual'
     (tmp_path/'config.json').write_text(json.dumps(config))
     saved,paths=load_account_ledger(tmp_path)

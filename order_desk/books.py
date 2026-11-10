@@ -130,6 +130,15 @@ def plan_strategies(
                 raise SignalError(f"{name}: original cycle budget missing")
             value = float(pending['budgets'][name])
             note = f"{name}: retained original cycle budget {value:,.2f}; sold proceeds are not lost and cash inputs are not applied twice"
+        elif name in ledger.get('manual_session', {}).get('carry_budgets', {}):
+            from order_desk.capital import _nonnegative
+            base = _nonnegative(name, 'retained capital', ledger['manual_session']['carry_budgets'][name])
+            extra = _nonnegative(name, 'extra_twd', entry['extra_twd'])
+            withdrawal = _nonnegative(name, 'cash_out_twd', entry['cash_out_twd'])
+            value = base + extra - withdrawal
+            if value < 0:
+                raise SignalError(f'{name}: withdrawal exceeds retained capital plus new funds')
+            note = f'{name}: manual plan retained capital {base:,.2f} + new extra {extra:,.2f} - new withdrawal {withdrawal:,.2f} = {value:,.2f}'
         else:
             value, note = target_value(
                 name, held, quotes, entry["extra_twd"], entry["cash_out_twd"]

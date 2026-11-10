@@ -187,6 +187,8 @@ def test_cli_historical_partial_recovery_replans_remainder_and_does_not_repeat(t
  from order_desk.deferrals import cycle_id
  from test_inventory_isolation import fixture
  cli,fake,args=fixture(tmp_path,monkeypatch,initial_short=False)
+ monkeypatch.setattr(cli, '_refuse_weekly_order', lambda *a: 0)
+ args = ['--config', str(tmp_path/'config.json'), '--weekly-order']
  config=json.loads((tmp_path/'config.json').read_text());config['inventory_mismatch_policy']='reconcile_actual'
  (tmp_path/'config.json').write_text(json.dumps(config))
  l,paths=load_account_ledger(tmp_path)

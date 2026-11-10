@@ -262,6 +262,9 @@ def submit_sells_then_buys(
     if completed:
         completed['outcome'] = 'completed_with_deferrals' if frozen_tickers(ledger, cycle_id()) else 'completed'
         ledger.setdefault('execution_history', []).append(copy.deepcopy(completed))
+        session = ledger.get('manual_session', {})
+        if completed.get('origin') == 'manual' and completed.get('manual_session_id') == session.get('id'):
+            session['state'] = 'completed'
     remember()
     return 'completed_with_deferrals' if frozen_tickers(ledger, cycle_id()) else 'completed'
 

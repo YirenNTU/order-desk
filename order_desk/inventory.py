@@ -86,6 +86,11 @@ def reconcile_actual_inventory(ledger, report, quotes):
                     after = max(0.0, before + delta * price)
                     execution['budgets'][name] = after
                     budget_changes[name] = {'before': before, 'after': after}
+                elif name in staged.get('manual_session', {}).get('carry_budgets', {}):
+                    carried = staged['manual_session']['carry_budgets']
+                    before = float(carried[name])
+                    carried[name] = max(0.0, before + delta * price)
+                    budget_changes[name] = {'before': before, 'after': carried[name]}
             if execution:
                 execution['reweight_required'] = True
                 execution['reallocate_strategies'] = sorted(set(execution.get('reallocate_strategies', [])) | set(changes))
