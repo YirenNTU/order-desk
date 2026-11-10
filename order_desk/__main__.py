@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from order_desk.control import blocking_orders, retention_scope, validate_retained_orders, begin_manual, config_signature, manual_hold, origin, release_manual, retire_for_manual
+from order_desk.control import frozen_working_stocks, blocking_orders, retention_scope, validate_retained_orders, begin_manual, config_signature, manual_hold, origin, release_manual, retire_for_manual
 from order_desk.audit import audit_with_history, record_audit, require_clear_audit
 from order_desk.cash import check_cash, money
 from order_desk.calendar import CalendarUnavailable, TwseCalendar
@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="place the planned orders; default is preview only",
     )
+    parser.add_argument("--freeze-working-stocks", action="store_true", help="with --new-manual-plan, retain working orders and freeze their stocks while rebalancing other stocks, reserving their capital")
     parser.add_argument("--keep-working-orders", action="store_true", help="with --new-manual-plan, retain verified non-overlapping orders of paused strategies")
     parser.add_argument("--new-manual-plan", action="store_true", help="hold scheduled sends, reconcile and retire old plan, then preview a new manual plan; requires --confirm APPROVE; never sends orders")
     parser.add_argument("--retry-terminal", action="store_true", help="explicitly retry confirmed failed/cancelled remainders of the saved plan")
@@ -81,6 +82,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weekly-order", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--weekly-tick", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.freeze_working_stocks and not args.new_manual_plan:
+        parser.error('--freeze-working-stocks requires --new-manual-plan')
+    args.keep_working_orders = args.keep_working_orders or args.freeze_working_stocks
     if args.keep_working_orders and not args.new_manual_plan:
         parser.error('--keep-working-orders requires --new-manual-plan')
     if args.new_manual_plan and (args.send or args.retry_terminal or args.reconcile_only or args.audit
@@ -197,7 +201,7 @@ def _run_account_once(args, config, root):
             report = audit_with_history(worker, ledger, root)
             record_audit(root, report)
             require_clear_audit(report)
-            scope = retention_scope(load_strategy_entries(config, root), ledger) if args.keep_working_orders else None
+            scope = retention_scope(load_strategy_entries(config, root), ledger, allow_active=args.freeze_working_stocks) if args.keep_working_orders else None
             retire_for_manual(ledger, scope=scope)
             ledger['manual_session']['state'] = 'waiting_for_reconciliation'
             save_account_ledger(root, ledger, ledger_paths)
@@ -332,6 +336,8 @@ def _run_account_once(args, config, root):
         ledger["execution"] = {
             'origin':'schedule' if args.weekly_order else 'manual',
             'manual_session_id':None if args.weekly_order else ledger['manual_session']['id'],
+            'retained_buy_reservations':preview.get('retained_buy_reservations', {}),
+            'frozen_working_stocks':sorted(frozen_working_stocks(ledger)),
             "trading_day": taipei_now().date().isoformat(),
             "cycle_id": preview['cycle_id'], 'budgets': preview['budgets'],
             'targets': preview['targets'], 'signal_signature': preview['signal_signature'],
@@ -409,9 +415,10 @@ def _plan_several(worker, config, root, policy, mode, ledger):
     if mode == "dry_run":
         raise SignalError("dry_run has no market prices; set mode to simulation")
     entries = load_strategy_entries(config, root)
-    validate_retained_orders(ledger, scope=retention_scope(entries, ledger))
+    validate_retained_orders(ledger, scope=retention_scope(entries, ledger,
+        allow_active=ledger.get('manual_session', {}).get('retained_scope', {}).get('allow_active', False)))
     tickers = sorted(
-        {
+        frozen_working_stocks(ledger) | {
             str(item["ticker"])
             for entry in entries
             if entry.get("adjust_positions", True) and entry.get("strategy")

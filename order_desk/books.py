@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from order_desk.control import frozen_working_stocks, retained_buy_reservations
 from order_desk.capital import combined_shares, target_value
 from order_desk.deferrals import cycle_id, frozen_tickers, signal_signature
 from order_desk.models import ExecutionPolicy, OrderPlan, Quote
@@ -102,7 +103,7 @@ def plan_strategies(
         if shares > broker_positions.get(ticker, 0) and ticker not in ledger.get('inventory_quarantine', {}):
             raise SignalError(f"{ticker}: managed ledger {shares} exceeds broker position {broker_positions.get(ticker, 0)}; reconcile fills/manual trading first")
     current_cycle = cycle_id(now)
-    frozen = frozen_tickers(ledger, current_cycle)
+    frozen = frozen_tickers(ledger, current_cycle) | frozen_working_stocks(ledger)
     pending = ledger.get('execution', {})
     reweight = bool(pending.get('reweight_required'))
     same_cycle = pending.get('cycle_id') == current_cycle
@@ -111,6 +112,7 @@ def plan_strategies(
     notes: list[str] = []
     if reweight and not same_cycle:
         notes.append('new rebalance cycle: old freeze released; latest weights use the unfinished execution capital cap, without reapplying cash inputs')
+    reservations = retained_buy_reservations(ledger, policy.cash_fee_rate, policy.cash_min_fee_twd)
     budgets: dict[str, float] = {}
     active: list[dict[str, Any]] = []
     paused_held: dict[str, dict[str, int]] = {}
@@ -143,6 +145,9 @@ def plan_strategies(
             value, note = target_value(
                 name, held, quotes, entry["extra_twd"], entry["cash_out_twd"]
             )
+            if reservations.get(name):
+                value += reservations[name]
+                note += f"; plus retained uninvested buy capital {reservations[name]:,.2f}, reserved below"
         notes.append(note)
         if value <= 0 and not held:
             notes.append(f"{name}: skipped, no holdings and no extra money")
@@ -158,6 +163,16 @@ def plan_strategies(
         result.update(budgets={}, cycle_id=current_cycle, signal_signature=signal_signature(entries), inventory_quarantine=sorted(ledger.get('inventory_quarantine', {})))
         return result
 
+    planning_budgets = dict(budgets)
+    for name, budget in budgets.items():
+        reserve = reservations.get(name, 0.0)
+        if reserve:
+            if reserve > budget + 1e-6:
+                raise SignalError(f'{name}: retained buy reservation {reserve:,.2f} exceeds post-withdrawal budget {budget:,.2f}; reduce withdrawal or resolve the retained order')
+            planning_budgets[name] = max(0.0,budget-reserve)
+            notes.append(f'{name}: post-withdrawal budget {budget:,.2f} - retained buy reservation {reserve:,.2f} = allocation budget {planning_budgets[name]:,.2f}; existing frozen holdings are deducted next')
+    if frozen_working_stocks(ledger):
+        notes.append('working stocks frozen for this manual session: '+', '.join(sorted(frozen_working_stocks(ledger))))
     current = now or datetime.now(timezone.utc)
     bundle = _merge_bundle(active, current)
     if reweight or frozen:
@@ -170,7 +185,7 @@ def plan_strategies(
     try:
         plan = build_order_plan(
             bundle,
-            budgets,
+            planning_budgets,
             quotes,
             managed,
             broker_positions,
@@ -185,6 +200,7 @@ def plan_strategies(
                 entry['name']: pending['targets'][entry['name']]
                 for entry in active
                 if reweight and same_cycle
+                and not reservations.get(entry['name'])
                 and entry['name'] not in pending.get('reallocate_strategies', [])
                 and not (set(ledger['strategies'].get(entry['name'], {})) & frozen)
                 and not any(str(w['ticker']) in frozen for w in entry['strategy']['weights'])
@@ -204,6 +220,7 @@ def plan_strategies(
     return {
         "plan": plan,
         "budgets": budgets,
+        "retained_buy_reservations": reservations,
         "inventory_quarantine": sorted(ledger.get('inventory_quarantine', {})),
         "cycle_id": current_cycle,
         "signal_signature": signal_signature(entries),

@@ -46,7 +46,7 @@ def retire_for_manual(ledger, *, scope=None):
     if retained and scope is None:
         raise SignalError('old orders are still working or unconfirmed; manual hold remains, no new orders')
     for order in retained:
-        _validate_retained_order(order, scope, ledger)
+        _validate_retained_order(order, scope, ledger, check_price_bound=False)
     pending = ledger.get('execution')
     if pending:
         submitted = pending.get('submitted', [])
@@ -67,10 +67,19 @@ def retire_for_manual(ledger, *, scope=None):
         ledger.setdefault('execution_history', []).append(archived)
         del ledger['execution']
     ledger.setdefault('order_history', []).extend(copy.deepcopy([o for o in orders if o not in retained]))
-    if retained:
+    if scope is not None:
         session['retained_scope'] = copy.deepcopy(scope)
+        if scope.get('allow_active'):
+            # A retained order may finish while the user edits/reviews settings.
+            # Keep that stock fixed for this same manual session as well.
+            same_session_final = [o for o in ledger.get('order_history', [])
+                                  if o.get('retained_for_manual') == session['id']]
+            session['frozen_working_stocks'] = sorted(set(session.get('frozen_working_stocks', []))
+                | {o['ticker'] for o in retained + same_session_final})
     for order in retained:
         order['retained_for_manual'] = session['id']
+        if scope.get('allow_active'):
+            order['retained_price_bound'] = order['broker_snapshot']['limit_price']
     ledger['open_orders'] = retained
 
 
@@ -87,17 +96,18 @@ def release_manual(ledger):
 
 
 
-def retention_scope(entries, ledger):
+def retention_scope(entries, ledger, *, allow_active=False):
     active = {e['name'] for e in entries if e.get('adjust_positions', True)}
     tickers = {str(w['ticker']) for e in entries if e['name'] in active
                for w in (e.get('strategy') or {}).get('weights', [])}
     for name in active:
         tickers.update(ledger.get('strategies', {}).get(name, {}))
-    return {'paused_strategies':sorted(e['name'] for e in entries if e['name'] not in active),
+    return {'allow_active':allow_active, 'configured_strategies':sorted(e['name'] for e in entries),
+            'paused_strategies':sorted(e['name'] for e in entries if e['name'] not in active),
             'active_tickers':sorted(tickers)}
 
 
-def _validate_retained_order(order, scope, ledger):
+def _validate_retained_order(order, scope, ledger, *, check_price_bound=True):
     from order_desk.validation import nonnegative_integer
     from order_desk.capital import filled_shares, quantity_to_shares
     if scope is None or order.get('status') not in {'Submitted', 'PartFilled', 'Filling'}:
@@ -107,7 +117,7 @@ def _validate_retained_order(order, scope, ledger):
         raise SignalError('retained prior-day order needs its final result')
     if order.get('action') not in {'Buy','Sell'} or order.get('order_lot') not in {'Common','IntradayOdd'}:
         raise SignalError('retained order type is unsupported')
-    if order.get('ticker') in scope['active_tickers']:
+    if order.get('ticker') in scope['active_tickers'] and not scope.get('allow_active'):
         raise SignalError('retained stock overlaps an active strategy; resolve that old order first')
     saved = order.get('broker_snapshot', {})
     if any(saved.get(k) != order.get(k) for k in ['broker_order_id','ticker','action','order_lot','status']):
@@ -125,13 +135,17 @@ def _validate_retained_order(order, scope, ledger):
     price = saved.get('limit_price')
     if isinstance(price,bool) or not isinstance(price,(int,float)) or not math.isfinite(price) or price <= 0:
         raise SignalError('retained order has no verifiable price bound')
+    if (scope.get('allow_active') and check_price_bound and order['action'] == 'Buy'
+            and price > order.get('retained_price_bound', price) + 1e-8):
+        raise SignalError('retained buy limit increased; prepare and review the frozen-stock plan again')
     legs = order.get('allocation', [])
     if (not legs or sum(nonnegative_integer(a['shares']) for a in legs) != qty
             or sum(nonnegative_integer(a.get('applied',0)) for a in legs) != applied):
         raise SignalError('retained strategy allocation is incomplete')
     owners = set()
     for a in legs:
-        if a['strategy'] not in scope['paused_strategies'] or a['strategy'] in owners:
+        allowed = scope.get('configured_strategies', []) if scope.get('allow_active') else scope['paused_strategies']
+        if a['strategy'] not in allowed or a['strategy'] in owners:
             raise SignalError('retained order must belong only to paused strategies')
         owners.add(a['strategy'])
         remaining = nonnegative_integer(a['shares'])-nonnegative_integer(a.get('applied',0))
@@ -145,6 +159,8 @@ def validate_retained_orders(ledger, *, scope=None, candidate_tickers=(), candid
     session = ledger.get('manual_session', {})
     scope = scope if scope is not None else session.get('retained_scope')
     reserved_sells = {}
+    if set(candidate_tickers) & frozen_working_stocks(ledger):
+        raise SignalError('new order touches a stock frozen for this manual session')
     for order in ledger.get('open_orders', []):
         if not order.get('retained_for_manual'):
             continue
@@ -158,10 +174,49 @@ def validate_retained_orders(ledger, *, scope=None, candidate_tickers=(), candid
                 if reserved_sells[key] > ledger.get('strategies',{}).get(key[0],{}).get(key[1],0):
                     raise SignalError('combined retained sells exceed strategy holdings')
         if (order['ticker'] in candidate_tickers
-                or any(a['strategy'] in candidate_strategies for a in order['allocation'])):
+                or (not scope.get('allow_active') and any(a['strategy'] in candidate_strategies for a in order['allocation']))):
             raise SignalError('new order overlaps retained stock or strategy')
 
 
 def blocking_orders(ledger):
     validate_retained_orders(ledger)
     return [o for o in ledger.get('open_orders', []) if not o.get('retained_for_manual')]
+
+
+
+def frozen_working_stocks(ledger):
+    return set(ledger.get('manual_session', {}).get('frozen_working_stocks', []))
+
+
+def retained_buy_reservations(ledger, fee_rate=0.001425, minimum_fee=20):
+    """Strategy capital bounds, independent of the account-level cash check.
+
+    Sum unfilled limit-price amounts and one incremental commission per order.
+    Part-cancelled quantities conservatively retain their original allocation
+    until final status because the broker does not allocate cancels by strategy.
+    """
+    from order_desk.cash import buy_cost, money
+    from order_desk.capital import quantity_to_shares
+    validate_retained_orders(ledger)
+    result = {}
+    for order in ledger.get('open_orders', []):
+        if not order.get('retained_for_manual') or order['action'] != 'Buy':
+            continue
+        snapshot = order['broker_snapshot']
+        price = money(snapshot['limit_price'], 'retained buy limit')
+        applied = order.get('applied_shares',0)
+        remaining = order['shares']-applied
+        deals = snapshot.get('status_detail',{}).get('deals',[])
+        if deals:
+            if sum(quantity_to_shares(x['quantity'],order['order_lot']) for x in deals) != applied:
+                raise SignalError('retained buy deal quantities do not match fills')
+            filled_value = sum(money(x['price'],'retained fill price')*quantity_to_shares(x['quantity'],order['order_lot']) for x in deals)
+        else:
+            filled_value = applied*price
+        reserve = buy_cost(filled_value+remaining*price,fee_rate,minimum_fee)-buy_cost(filled_value,fee_rate,minimum_fee)
+        for leg in order['allocation']:
+            left = leg['shares']-leg.get('applied',0)
+            if left:
+                name = leg['strategy']
+                result[name] = result.get(name,0.0)+math.ceil(reserve*left/remaining)
+    return result
