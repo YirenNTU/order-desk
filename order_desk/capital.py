@@ -21,7 +21,7 @@ from order_desk.planner import _price_for_size
 from order_desk.signal import SignalError
 from order_desk.validation import nonnegative_integer
 
-TERMINAL_ORDER_STATUSES = {"Filled", "Cancelled", "Failed"}
+TERMINAL_ORDER_STATUSES = {"Filled", "Cancelled", "Failed", "Expired"}
 
 
 def empty_ledger() -> dict[str, Any]:

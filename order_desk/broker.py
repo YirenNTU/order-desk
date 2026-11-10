@@ -461,6 +461,59 @@ class ShioajiBroker:
             int(getattr(trade.status, "deal_quantity", 0)) * multiplier,
         )
 
+    def historical_accounting(self, begin_date, end_date, tickers):
+        """Read dated cash-stock accounting; no order operation is performed."""
+        if self.api is None:
+            raise BrokerError('broker is not connected')
+        import shioaji as sj
+        from datetime import date
+        first, last = date.fromisoformat(begin_date), date.fromisoformat(end_date)
+        if not 0 < (last - first).days <= 31:
+            raise BrokerError('historical accounting supports 1 to 31 calendar days')
+        def positions():
+            values = self.api.list_positions(account=self.account, unit=sj.Unit.Share)
+            for x in values:
+                if str(x.code) in tickers and _enum_value(x.cond) not in {'Cash', 'Netting'}:
+                    raise BrokerError('non-cash position overlaps historical reconciliation symbol')
+            return [x for x in values if _enum_value(x.cond) in {'Cash', 'Netting'} and _enum_value(x.direction) == 'Buy']
+        before = positions()
+        def signature(values):
+            return sorted((str(x.code), nonnegative_integer(x.quantity)) for x in values)
+        lots = []
+        for p in before:
+            if str(p.code) not in tickers:
+                continue
+            values = self.api.list_position_detail(account=self.account, detail_id=p.id)
+            rows = []
+            for x in values:
+                if _enum_value(x.cond) not in {'Cash', 'Netting'} or _enum_value(x.direction) != 'Buy':
+                    raise BrokerError('historical cash position detail condition mismatch')
+                rows.append({'ticker':str(x.code),'date':str(x.date),'dseq':str(x.dseq),
+                             'quantity':nonnegative_integer(x.quantity),'unit':'CommonTruncated'})
+            lots.append({'ticker':str(p.code),'shares':nonnegative_integer(p.quantity),'lots':rows})
+        realized = self.api.list_profit_loss(account=self.account, begin_date=begin_date,
+                                             end_date=end_date, unit=sj.Unit.Share)
+        sales = []
+        for p in realized:
+            if _enum_value(p.cond) not in {'Cash', 'Netting'}:
+                if str(p.code) in tickers:
+                    raise BrokerError('non-cash realized trade overlaps historical reconciliation symbol')
+                continue
+            # Read every sale's source: a buy may have been sold before this query.
+            details = self.api.list_profit_loss_detail(account=self.account, detail_id=p.id, unit=sj.Unit.Share)
+            sources = []
+            for x in details:
+                if _enum_value(x.cond) not in {'Cash', 'Netting'}:
+                    raise BrokerError('historical sale source condition mismatch')
+                sources.append({'ticker':str(x.code),'date':str(x.date),'dseq':str(x.dseq),
+                                'shares':nonnegative_integer(x.quantity)})
+            sales.append({'ticker':str(p.code),'date':str(p.date),'dseq':str(p.dseq),
+                          'shares':nonnegative_integer(p.quantity),'buy_sources':sources})
+        after = positions()
+        return {'begin_date':begin_date,'end_date':end_date,'fetched_at':datetime.now(timezone.utc).isoformat(),
+                'account_binding':{'mode':self.mode,'account':hashlib.sha256(str(self.account.account_id).encode()).hexdigest()},
+                'positions':lots,'sales':sales,'positions_stable':signature(before)==signature(after),'complete':True}
+
     def reconcile_orders(self) -> list[Mapping[str, Any]]:
         if self.api is None:
             raise BrokerError("broker is not connected")
@@ -482,6 +535,9 @@ class ShioajiBroker:
             results.append(
                 {
                     "broker_order_id": str(trade.order.id),
+                    "broker_order_number": str(getattr(trade.order, "ordno", "")),
+                    "broker_sequence": str(getattr(trade.order, "seqno", "")),
+                    "order_type": _enum_value(getattr(trade.order, "order_type", "ROD")),
                     "custom_field": str(getattr(trade.order, "custom_field", "")),
                     "status": str(trade.status.status).split(".")[-1],
                     "filled_quantity": nonnegative_integer(getattr(trade.status, "deal_quantity", 0), "broker filled quantity"),
@@ -528,6 +584,9 @@ class BrokerWorker:
                     future.set_result(getattr(self.adapter, method)(*args, **kwargs))
                 except BaseException as exc:
                     future.set_exception(exc)
+
+    def supports(self, method: str) -> bool:
+        return callable(getattr(self.adapter, method, None))
 
     def call(self, method: str, *args: Any, timeout: float = 65, **kwargs: Any) -> Any:
         future: Future[Any] = Future()

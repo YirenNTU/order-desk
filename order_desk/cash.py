@@ -8,7 +8,7 @@ from order_desk.validation import nonnegative_integer
 from order_desk.signal import SignalError
 
 TAIPEI = ZoneInfo('Asia/Taipei')
-TERMINAL = {'Filled', 'Cancelled', 'Failed'}
+TERMINAL = {'Filled', 'Cancelled', 'Failed', 'Expired'}
 
 
 def money(value, label):

@@ -471,6 +471,8 @@ def _print_open_orders(ledger: dict, confirmed: bool) -> None:
         print("unfilled orders stay until the next day; nothing new was planned")
     else:
         print("orders are still working; nothing new was planned")
+    for alert in ledger.get('historical_reconciliation_alerts', []):
+        print(f"historical reconciliation: {alert.get('ticker', 'account')}: {alert['reason']}")
     for order in ledger["open_orders"]:
         print(
             f"{order['ticker']} {order['action']} "

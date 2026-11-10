@@ -127,7 +127,7 @@ def audit_account(worker, ledger, *, tickers=(), baseline=None, observed_orders=
                             blockers.append(f'{ticker}: manual fill direction unavailable')
                         else:
                             external[ticker] = external.get(ticker, 0) + (delta if action == 'Buy' else -delta)
-            if (key in live_keys or row['observed_trading_day'] == current_day) and ticker in relevant and status not in {'Filled', 'Cancelled', 'Failed'}:
+            if (key in live_keys or row['observed_trading_day'] == current_day) and ticker in relevant and status not in {'Filled', 'Cancelled', 'Failed', 'Expired'}:
                 action = str(row.get('action', '')).split('.')[-1]
                 if action == 'Sell' and 'quantity' in row:
                     total = quantity_to_shares(row['quantity'], row.get('order_lot'))

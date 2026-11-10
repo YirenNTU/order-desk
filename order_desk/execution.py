@@ -52,10 +52,39 @@ def _refresh_orders(worker, ledger, *, today=None):
             raise SignalError("duplicate broker order identity; reconcile manually")
         if key:
             by_id[key] = row
+    # Query history once for missing prior-day orders, then preserve its evidence
+    # in the same atomic ledger snapshot as any recovered cumulative fills.
+    historical = {}
+    missing = []
+    for order in open_orders:
+        saved = order.get('broker_snapshot', {})
+        current = by_id.get(str(order.get('broker_order_id', '')))
+        current_date = str((current or {}).get('trading_day') or (current or {}).get('order_datetime') or '')[:10]
+        if (_placed_before_today(order, current_day)
+                and (current is None or (current_date and current_date != order['trading_day']))
+                and saved.get('status') not in TERMINAL_ORDER_STATUSES):
+            missing.append(order)
+    if missing and getattr(worker, 'supports', lambda method: False)('historical_accounting'):
+        from order_desk.history import resolve_history
+        try:
+            first = min(o['trading_day'] for o in missing)
+            tickers = sorted({o['ticker'] for o in missing} | {o['ticker'] for o in ledger.get('order_history', []) + open_orders
+                if first <= o.get('trading_day', '') < current_day and o.get('applied_shares', 0) > 0})
+            snapshot = worker.call('historical_accounting', first, current_day, tickers, timeout=180)
+            recovered, alerts, evidence_id = resolve_history(snapshot, ledger, missing, today=current_day)
+            ledger['historical_reconciliation_alerts'] = alerts
+            if recovered:
+                ledger.setdefault('historical_accounting_evidence', {}).setdefault(evidence_id, snapshot)
+            historical = {(r['trading_day'], r['broker_order_id']):r for r in recovered}
+        except (BrokerError, SignalError, ValueError, TypeError, KeyError) as exc:
+            ledger['historical_reconciliation_alerts'] = [{'reason':str(exc),'source':'historical_accounting'}]
     still_open: list[dict[str, Any]] = []
     confirmed = True
     for order in open_orders:
         row = by_id.get(str(order.get("broker_order_id", "")))
+        row_date = str((row or {}).get('trading_day') or (row or {}).get('order_datetime') or '')[:10]
+        if row_date and row_date != order.get('trading_day'):
+            row = None  # IDs may be reused on another trading date.
         if row is None and order.get("custom_field") and order.get("trading_day") == current_day:
             matches = [r for r in rows if r.get("custom_field") == order["custom_field"]]
             if len(matches) > 1:
@@ -69,6 +98,8 @@ def _refresh_orders(worker, ledger, *, today=None):
             if (str(saved.get('status', '')).split('.')[-1] in TERMINAL_ORDER_STATUSES
                     and str(saved.get('broker_order_id', '')) == str(order.get('broker_order_id', ''))):
                 row = saved
+        if row is None:
+            row = historical.get((order.get('trading_day'), str(order.get('broker_order_id', ''))))
         if row is None:
             order["status"] = "Unconfirmed"
             still_open.append(order)
@@ -91,6 +122,9 @@ def _refresh_orders(worker, ledger, *, today=None):
             raise SignalError(f"{order['ticker']}: broker fill exceeds the order")
         if filled > applied:
             _apply_allocated_fill(ledger, order, filled)
+        if row.get('reconciliation_source') == 'historical_accounting':
+            order.setdefault('original_broker_snapshot', copy.deepcopy(order.get('broker_snapshot', {})))
+            order['historical_reconciliation'] = copy.deepcopy(row)
         order["broker_snapshot"] = copy.deepcopy(row)
         status = str(row.get("status", "")).split(".")[-1]
         order["status"] = status
