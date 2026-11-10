@@ -136,6 +136,8 @@ def build_order_plan(
 ) -> OrderPlan:
     if mode not in {"dry_run", "simulation", "production"}:
         raise PlanningError("invalid execution mode")
+    if isinstance(policy.max_turnover, bool) or not math.isfinite(policy.max_turnover) or policy.max_turnover < 0:
+        raise PlanningError('max_turnover must be finite and nonnegative')
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     effective = datetime.fromisoformat(str(bundle["effective_at"]).replace("Z", "+00:00"))
     expires = datetime.fromisoformat(str(bundle["expires_at"]).replace("Z", "+00:00"))
@@ -267,8 +269,25 @@ def build_order_plan(
     gross = buy_twd + sell_twd
     if gross > policy.max_daily_twd + 1e-6:
         raise PlanningError("gross orders exceed max_daily_twd")
-    if total_budget > 0 and gross / total_budget > policy.max_turnover + 1e-9:
-        raise PlanningError("planned turnover exceeds max_turnover")
+    # A withdrawal shrinks the target budget but still requires selling the
+    # original holdings. Measure turnover against the larger portfolio side,
+    # excluding all external and paused-strategy positions from the basis.
+    current_managed_value = 0.0
+    for ticker, shares in managed.items():
+        if ticker not in quotes:
+            raise PlanningError(f'{ticker}: quote required for turnover valuation')
+        _validate_quote(quotes[ticker])
+        current_managed_value += shares * _price_for_size(quotes[ticker])
+    turnover_basis = max(current_managed_value, total_budget)
+    if not math.isfinite(turnover_basis) or turnover_basis < 0:
+        raise PlanningError('invalid turnover valuation')
+    turnover_ratio = gross / turnover_basis if turnover_basis else 0.0
+    if (gross > 0 and turnover_basis == 0) or turnover_ratio > policy.max_turnover + 1e-9:
+        raise PlanningError(
+            f'planned turnover exceeds max_turnover: gross={gross:,.2f}, '
+            f'basis={turnover_basis:,.2f} (managed_before={current_managed_value:,.2f}, '
+            f'target_budget={total_budget:,.2f}), ratio={turnover_ratio:.4f}, limit={policy.max_turnover:g}'
+        )
     buying_power = max(0.0, available_cash - policy.cash_reserve_twd)
     if policy.allow_sell_proceeds_for_buys:
         buying_power += sell_twd
@@ -293,4 +312,7 @@ def build_order_plan(
         total_budget_twd=round(total_budget, 2),
         cash_reserve_twd=round(policy.cash_reserve_twd, 2),
         warnings=tuple(warnings),
+        turnover_basis_twd=round(turnover_basis, 2),
+        turnover_ratio=turnover_ratio,
+        max_turnover=policy.max_turnover,
     )

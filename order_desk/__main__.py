@@ -338,6 +338,8 @@ def _run_account_once(args, config, root):
             'manual_session_id':None if args.weekly_order else ledger['manual_session']['id'],
             'retained_buy_reservations':preview.get('retained_buy_reservations', {}),
             'frozen_working_stocks':sorted(frozen_working_stocks(ledger)),
+            'turnover':{'basis_twd':preview['plan'].turnover_basis_twd,
+                        'ratio':preview['plan'].turnover_ratio, 'limit':preview['plan'].max_turnover},
             "trading_day": taipei_now().date().isoformat(),
             "cycle_id": preview['cycle_id'], 'budgets': preview['budgets'],
             'targets': preview['targets'], 'signal_signature': preview['signal_signature'],
@@ -493,7 +495,7 @@ def _policy(config: dict, several: bool) -> ExecutionPolicy:
         max_order_twd=float(config.get("max_order_twd", 50_000_000)),
         max_daily_twd=float(config.get("max_daily_twd", 50_000_000)),
         max_position_twd=float(config.get("max_position_twd", 50_000_000)),
-        max_turnover=float(config.get("max_turnover", 2)),
+        max_turnover=money(config.get("max_turnover", 2), "max turnover"),
         allow_sell_proceeds_for_buys=several,
         cash_check=config.get('mode') == 'production' or bool(config.get('cash_check', True)),
         cash_fee_rate=money(config.get('cash_fee_rate', 0.001425), 'cash fee rate'),
@@ -532,6 +534,7 @@ def _print_preview(preview: dict) -> None:
             target = int(preview["targets"].get(name, {}).get(ticker, 0))
             print(f"  {ticker} held {held} -> {target}")
     print(f"data_as_of: {plan.data_as_of}  budget: {plan.total_budget_twd:,.0f} TWD")
+    print(f"turnover: gross={plan.estimated_buy_twd + plan.estimated_sell_twd:,.2f} / basis={plan.turnover_basis_twd:,.2f} = {plan.turnover_ratio:.4f}; max_turnover={plan.max_turnover:g}")
     print(f"{'ticker':<8} {'side':<4} {'shares':>8} {'lot':<12} {'limit':>10} {'twd':>12}")
     if not plan.orders:
         print("(no orders)")

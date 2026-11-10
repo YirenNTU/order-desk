@@ -72,6 +72,9 @@ class OrderPlan:
     total_budget_twd: float
     cash_reserve_twd: float
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    turnover_basis_twd: float = 0.0
+    turnover_ratio: float = 0.0
+    max_turnover: float = 2.0
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
