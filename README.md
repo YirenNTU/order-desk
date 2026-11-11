@@ -42,6 +42,39 @@ git pull --ff-only
 
 預覽不會送單；正式執行會重新核對與計算，行情改變時差額也可能改變。`cash_out_twd` 是降低策略配置的目標，並非銀行轉帳，也不保證成交後的淨賣款恰好等於該金額。實際款項依成交、費用與交割結果確認。不要為了重跑指令而刪除帳本、鎖檔或未完成紀錄。
 
+### 出現 `manual session already completed` 怎麼辦？
+
+```text
+manual session already completed; use --new-manual-plan to request another rebalance
+```
+
+這代表帳本中的上一個手動計畫已完成；這次 `--send` 沒有送出新單。即使修改了 `config.json` 的策略、提領金額或 `adjust_positions`，單獨重跑 `--send` 也不會另開一輪。這是防止重複交易的保護。
+
+| 你現在要做的事 | 下一步 |
+| --- | --- |
+| 確認原本那筆提領是否完成 | 核對成交與帳務紀錄，不要為了消除提示建立新計畫。需要更新既有委託紀錄時用 `--reconcile-only`。 |
+| 原手動計畫仍未完成，要接著做 | 設定不變時用 `--send --confirm APPROVE` 續跑；若已顯示上述完成提示，就不是這個情況。 |
+| 確實要另外提領、投入，或重新調倉 | 設定本次金額與參與策略，先用 `--new-manual-plan` 建立新預覽，確認後再 `--send`。 |
+| 手動工作結束，要恢復自動下單 | 檢查下一輪設定後，依下方「手動調倉與排程分開」使用 `--resume-schedule`；這可能立即送單。 |
+
+例如：策略 A 的提領已完成，現在要**另外從策略 B 提領**。先把 A 的 `cash_out_twd`、`extra_twd` 改回 `0`，並設 `adjust_positions: false`；B 設為 `true`，填入這次要提領的金額，其他不想調整的策略設為 `false`。接著分兩步執行：
+
+```bash
+# 1. 建立新計畫並預覽，不送單
+.venv/bin/python -m order_desk --new-manual-plan --confirm APPROVE
+```
+
+若要保留已確認的掛單、固定其股票並調整同策略其他股票，第 1 步改用 `--new-manual-plan --freeze-working-stocks --confirm APPROVE`。這不是任意股票鎖定功能；新計畫不會自動延續上一個已完成計畫的固定股票清單，須檢查本次預覽。
+
+```bash
+# 2. 確認預覽中的參與策略、預算與買賣差額後，才正式送單
+.venv/bin/python -m order_desk --send --confirm APPROVE
+```
+
+**`cash_out_twd` 和 `extra_twd` 不會在完成後自動清零。** 同一未完成計畫的續跑不會重複套用金額，但另一個新計畫會重新讀取設定。已完成的一次性投入／提領，應在建立下一個計畫或恢復排程前改回 `0`，除非確實要再做一次；不要在原計畫尚未完成時，為了續跑而修改金額。
+
+完成提示只反映手動計畫狀態，不表示每一檔都已成交、銀行已入帳或排程已恢復。計畫可能以 `completed_with_deferrals` 完成，或仍保留其他既有掛單；實際結果須核對成交、延後處理紀錄與交割資料。
+
 ## 安裝
 
 ```bash
@@ -254,6 +287,8 @@ python -m order_desk --send --confirm APPROVE
 | `.venv/bin/python: no such file or directory` | 確認目前是包含 `.venv/` 的 Order Desk 專案目錄；初次安裝須先建立虛擬環境。 |
 | `another Order Desk process is using this account` | 另一個程序持有帳戶鎖。等它完成，不要刪鎖檔或同時反覆啟動送單。 |
 | `saved plan belongs to schedule/legacy` | 手動指令不能直接接手排程舊計畫；先選擇上方合適的 `--new-manual-plan` 預覽流程。 |
+| `manual session already completed; use --new-manual-plan to request another rebalance` | 上一個手動計畫已完成，這次沒有送新單。改設定也不會自動開新計畫；只有確實要另一筆調整才建立新預覽，勿重複套用已完成的提領金額。詳見上方完成提示說明。 |
+| `manual settings changed` | 未完成手動計畫的設定已變更，不能直接續送。若確實要改計畫，先用 `--new-manual-plan` 核對並重新預覽；若只是續跑，確認並恢復原設定。 |
 | `retained stock overlaps an active strategy` | `--keep-working-orders` 只處理不重疊的其他策略掛單。同策略要先調整其他股票時，改用 `--freeze-working-stocks` 重新預覽。 |
 | `withdrawal exceeds retained capital plus new funds` | 提領金額超過該策略原預算加新增投入。確認金額放在正確策略，且沒有把投入誤填成提領；重跑指令不會修改設定。 |
 | `retained buy reservation … exceeds post-withdrawal budget` / `frozen holdings exceed cycle budget` | 提領後的預算不足以保留原掛單或固定持股。確認提領目標與保留內容，不能忽略其資金義務。 |
